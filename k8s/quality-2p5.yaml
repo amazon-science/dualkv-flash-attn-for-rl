@@ -1,0 +1,66 @@
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: quality-2p5
+  namespace: testing
+spec:
+  elasticPolicy:
+    maxReplicas: 2
+    maxRestarts: 100
+    minReplicas: 2
+    rdzvBackend: c10d
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 2
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: quality-2p5
+          namespace: testing
+        spec:
+          containers:
+          - args:
+            - -c
+            - |
+              sleep infinity
+            command:
+            - /bin/sh
+            image: nvcr.io/nvidia/pytorch:25.01-py3
+            imagePullPolicy: Always
+            name: pytorch
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "8"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "8"
+            securityContext:
+              capabilities:
+                add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+              runAsNonRoot: false
+              runAsUser: 0
+              seccompProfile:
+                type: Unconfined
+            volumeMounts:
+            - mountPath: /dev/shm
+              name: shmem
+            - mountPath: /local
+              name: local
+            - mountPath: /fsx
+              name: fsx-storage
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - hostPath:
+              path: /dev/shm
+            name: shmem
+          - hostPath:
+              path: /opt/dlami/nvme
+            name: local
+          - name: fsx-storage
+            persistentVolumeClaim:
+              claimName: fsx-claim
