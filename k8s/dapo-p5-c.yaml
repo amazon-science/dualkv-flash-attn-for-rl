@@ -1,0 +1,65 @@
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: dapo-p5-c
+  namespace: testing
+spec:
+  elasticPolicy:
+    rdzvBackend: c10d
+    minReplicas: 1
+    maxReplicas: 1
+    maxRestarts: 100
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          namespace: testing
+          labels:
+            app: dapo-p5-c
+        spec:
+          volumes:
+            - name: shmem
+              hostPath:
+                path: /dev/shm
+            - name: local
+              hostPath:
+                path: /opt/dlami/nvme
+            - name: fsx-storage
+              persistentVolumeClaim:
+                claimName: fsx-claim
+          nodeSelector:
+            node.kubernetes.io/instance-type: "ml.p5.48xlarge"
+          containers:
+            - name: pytorch
+              image: nvcr.io/nvidia/pytorch:25.01-py3
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 8
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 8
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
+                seccompProfile:
+                  type: Unconfined
+                capabilities:
+                  add:
+                    - SYS_ADMIN
+                    - SYS_PTRACE
+              command: ["/bin/sh"]
+              args:
+                - "-c"
+                - |
+                  sleep infinity
+              volumeMounts:
+                - name: shmem
+                  mountPath: /dev/shm
+                - name: local
+                  mountPath: /local
+                - name: fsx-storage
+                  mountPath: /fsx
