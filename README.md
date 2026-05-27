@@ -252,10 +252,10 @@ torchrun --nproc-per-node=2 experiments/test_dualkv_sp_correctness.py
 ## Citation
 
 ```bibtex
-@inproceedings{dualkv2026,
+@article{dualkv2026,
   title={DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training},
-  author={Gai, Jiading and Zhang, Shuai and Song, Xiang and Wang, Bernie and Karypis, George},
-  booktitle={NeurIPS},
+  author={Gai, Jiading* and Zhang, Shuai* and Song, Xiang and Wang, Bernie and Karypis, George},
+  journal={arXiv preprint arXiv:2605.15422},
   year={2026}
 }
 ```
