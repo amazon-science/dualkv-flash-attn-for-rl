@@ -123,6 +123,8 @@ export WORKDIR=/path/to/your/workdir
 export WANDB_API_KEY=your_key   # optional, scripts fall back to console logging
 ```
 
+**Notation:** `mb` = micro-batch size (prompt groups per training step), `P` = prompt length, `N` = number of responses per prompt, `R` = response length, `SP` = Ulysses sequence parallelism degree, `DP` = data parallelism degree, `FA2`/`FA3` = FlashAttention-2/3.
+
 ### Table 1: Kernel-Level Benchmarks (1x H100 or A100)
 
 Isolated DualKV vs FA2 attention kernel timing (fwd + bwd), fp16.
@@ -178,7 +180,7 @@ torchrun --standalone --nproc-per-node 8 experiments/benchmark_qwen3_single_step
 | DualKV mb=4 | `bash experiments/run_dapo_qwen3_8b_longreason_dualkv_mb4.sh` |
 | DualKV mb=8 | `bash experiments/run_dapo_qwen3_8b_longreason_dualkv_mb8.sh` |
 
-### Table 3: Multi-Node MoE (Qwen3-30B-A3B, 16x H100, 2 nodes)
+### Table 3: Multi-Node MoE (Mixture of Experts) (Qwen3-30B-A3B, 16x H100, 2 nodes)
 
 Start a 2-node Ray cluster first:
 
