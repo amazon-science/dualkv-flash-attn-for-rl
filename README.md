@@ -1,6 +1,6 @@
 # DualKV: Shared-Prompt Flash-Attention for RL Training
 
-Code release for *"DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training"*.
+Code release for *["DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training"](https://arxiv.org/abs/2605.15422)*.
 
 DualKV deduplicates shared prompts in GRPO/DAPO training — instead of computing attention over `N*(P+R)` tokens, it computes over `P + N*R`, yielding up to 6x kernel speedup and 2x end-to-end throughput on long-context RL workloads. This release includes the custom flash-attention kernels, veRL integration (with Ulysses Sequence Parallelism support), and scripts to reproduce all paper experiments.
 
