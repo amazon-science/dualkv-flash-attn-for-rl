@@ -124,18 +124,32 @@ def _make_dualkv_flash_wrapper(original_fn):
     and uses context FA (once) + DualKV kernel (per-sequence decoded attention).
     Otherwise delegates to the original flash attention function unchanged.
 
-    The Q/K/V tensors arrive in (batch=1, total_tokens, heads, hdim) format.
+    Supports Ulysses SP: when SP > 1, performs all-to-all to reconstruct the full
+    token sequence (with partial heads) before running the DualKV kernel, then
+    scatters back after.
     """
 
     def _dualkv_flash_forward(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs):
-        dualkv_context = kwargs.get("dualkv_context", None)
+        dualkv_context = kwargs.pop("dualkv_context", None)
         if dualkv_context is None:
             return original_fn(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs)
 
         from flash_attn import flash_attn_dualkv_varlen_func, flash_attn_varlen_func
 
-        # Q, K, V are (1, T, heads, hdim) in rmpad mode
-        q = query_states.squeeze(0)  # (T, heads, hdim)
+        sp_size = get_ulysses_sequence_parallel_world_size()
+
+        # --- Ulysses pre-attention: gather sequence, scatter heads ---
+        if sp_size > 1:
+            repeats = max(sp_size // key_states.size(2), 1)
+            if repeats > 1:
+                key_states = key_states.repeat(1, 1, repeats, 1)
+                value_states = value_states.repeat(1, 1, repeats, 1)
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2)
+            key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
+
+        # Q, K, V are (1, T, H/sp, hdim) when SP>1, or (1, T, H, hdim) when SP=1
+        q = query_states.squeeze(0)
         k = key_states.squeeze(0)
         v = value_states.squeeze(0)
 
@@ -149,13 +163,9 @@ def _make_dualkv_flash_wrapper(original_fn):
             ds = g["dec_start"]
             de = g["dec_end"]
 
-            # Context: views into the packed tensor — zero copy
             q_ctx, k_ctx, v_ctx = q[ps : ps + P], k[ps : ps + P], v[ps : ps + P]
-
-            # Decoded: contiguous in packed layout — zero copy
             q_dec, k_dec, v_dec = q[ds:de], k[ds:de], v[ds:de]
 
-            # Call 1: Context self-attention (P tokens, once per group)
             cu_ctx = torch.tensor([0, P], device=q.device, dtype=torch.int32)
             ctx_out = flash_attn_varlen_func(
                 q_ctx, k_ctx, v_ctx, cu_ctx, cu_ctx, P, P,
@@ -163,8 +173,6 @@ def _make_dualkv_flash_wrapper(original_fn):
                 deterministic=True,
             )
 
-            # Call 2: Decoded attention via DualKV kernel
-            # Each response attends to shared context K/V + its own decoded K/V
             cu_dec = g["cu_seqlens_dec"]
             max_dec = g["max_decoded"]
             dec_out = flash_attn_dualkv_varlen_func(
@@ -180,8 +188,13 @@ def _make_dualkv_flash_wrapper(original_fn):
             out_parts.append(ctx_out)
             out_parts.append(dec_out)
 
-        out = torch.cat(out_parts, dim=0)  # (T, heads, hdim)
-        return out.unsqueeze(0)  # (1, T, heads, hdim)
+        out = torch.cat(out_parts, dim=0).unsqueeze(0)  # (1, T, H/sp, hdim)
+
+        # --- Ulysses post-attention: gather heads, scatter sequence ---
+        if sp_size > 1:
+            out = gather_heads_scatter_seq(out, seq_dim=1, head_dim=2)
+
+        return out
 
     return _dualkv_flash_forward
 

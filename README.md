@@ -1,6 +1,8 @@
-# DualKV: Reproducing Paper Experiments
+# DualKV: Shared-Prompt Flash-Attention for RL Training
 
-Code for reproducing experiments in *"DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training"*.
+Code release for *"DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training"*.
+
+DualKV deduplicates shared prompts in GRPO/DAPO training — instead of computing attention over `N*(P+R)` tokens, it computes over `P + N*R`, yielding up to 6x kernel speedup and 2x end-to-end throughput on long-context RL workloads. This release includes the custom flash-attention kernels, veRL integration (with Ulysses Sequence Parallelism support), and scripts to reproduce all paper experiments.
 
 ## Repository Structure
 
@@ -12,12 +14,13 @@ Code for reproducing experiments in *"DualKV: Shared-Prompt Flash-Attention Kern
 └── THIRD_PARTY_LICENSES
 ```
 
-The DualKV kernel implementation can be browsed directly:
+Key implementation files:
 - **Forward kernel**: `flash-attention/csrc/flash_attn/src/flash_fwd_kernel_dualkv_training.h`
 - **Backward kernel**: `flash-attention/csrc/flash_attn/src/flash_bwd_kernel_dualkv_training.h`
 - **Python interface**: `flash-attention/flash_attn/flash_attn_interface.py` (search for `dualkv`)
 - **veRL actor integration**: `verl/verl/workers/actor/dp_actor.py` (search for `_dualkv`)
-- **Attention monkey-patch**: `verl/verl/models/transformers/monkey_patch.py`
+- **Attention monkey-patch + SP**: `verl/verl/models/transformers/monkey_patch.py` (DualKV + Ulysses all-to-all)
+- **SP correctness test**: `experiments/test_dualkv_sp_correctness.py`
 
 ## Hardware Requirements
 
@@ -225,6 +228,23 @@ python experiments/bench_long_context_sweep.py
 
 ```bash
 python experiments/predict_memory.py
+```
+
+### DualKV + Ulysses Sequence Parallelism (8x H100)
+
+DualKV composes with Ulysses SP for additional memory savings. The DualKV repack
+happens before the Ulysses sequence slice, and all-to-all communication is performed
+inside the attention kernel wrapper to reconstruct the full token sequence per rank.
+
+```bash
+# DualKV + SP=2 (DP=4, SP=2): combines prompt deduplication with head splitting
+bash experiments/run_qwen3_8b_longreason_dualkv_mb8_sp2.sh
+```
+
+Correctness test (requires 2 GPUs):
+
+```bash
+torchrun --nproc-per-node=2 experiments/test_dualkv_sp_correctness.py
 ```
 
 ## Citation

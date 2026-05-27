@@ -424,6 +424,28 @@ class DataParallelPPOActor(BasePPOActor):
                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
                     )
 
+                # DualKV repack BEFORE Ulysses slice — repack needs full sequence
+                dualkv_ctx = None
+                repack_info = None
+                if self.use_dualkv and not is_mask_all_zero:
+                    prompt_allocated = micro_batch["input_ids"].size(1) - micro_batch["responses"].size(1)
+                    uids = micro_batch.get("uid", None) if hasattr(micro_batch, 'get') else None
+                    if uids is None and hasattr(micro_batch, 'non_tensor_batch'):
+                        uids = micro_batch.non_tensor_batch.get("uid", None)
+                    prompt_group_sizes = _compute_prompt_group_sizes(uids, cu_seqlens.shape[0] - 1)
+
+                    prompt_lens = []
+                    seq_idx = 0
+                    for g_size in prompt_group_sizes:
+                        p_len = micro_batch["attention_mask"][seq_idx, :prompt_allocated].sum().item()
+                        prompt_lens.append(int(p_len))
+                        seq_idx += g_size
+
+                    input_ids_rmpad, position_ids_rmpad, dualkv_ctx, repack_info = _dualkv_repack(
+                        input_ids_rmpad, cu_seqlens, position_ids_rmpad,
+                        prompt_lens, prompt_group_sizes,
+                    )
+
                 # for compute the log_prob
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
 
@@ -459,25 +481,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                if self.use_dualkv and not is_mask_all_zero:
-                    prompt_allocated = micro_batch["input_ids"].size(1) - micro_batch["responses"].size(1)
-                    uids = micro_batch.get("uid", None) if hasattr(micro_batch, 'get') else None
-                    if uids is None and hasattr(micro_batch, 'non_tensor_batch'):
-                        uids = micro_batch.non_tensor_batch.get("uid", None)
-                    prompt_group_sizes = _compute_prompt_group_sizes(uids, cu_seqlens.shape[0] - 1)
-
-                    prompt_lens = []
-                    seq_idx = 0
-                    for g_size in prompt_group_sizes:
-                        p_len = micro_batch["attention_mask"][seq_idx, :prompt_allocated].sum().item()
-                        prompt_lens.append(int(p_len))
-                        seq_idx += g_size
-
-                    input_ids_packed, position_ids_packed, dualkv_ctx, repack_info = _dualkv_repack(
-                        input_ids_rmpad, cu_seqlens, position_ids_rmpad,
-                        prompt_lens, prompt_group_sizes,
-                    )
-
+                if dualkv_ctx is not None:
                     if self.use_fused_kernels:
                         shared_positions = [
                             g["prompt_start"] + g["prompt_len"] - 1
@@ -485,9 +489,9 @@ class DataParallelPPOActor(BasePPOActor):
                         ]
 
                         output = self.actor_module(
-                            input_ids=input_ids_packed,
+                            input_ids=input_ids_rmpad,
                             attention_mask=None,
-                            position_ids=position_ids_packed,
+                            position_ids=position_ids_rmpad,
                             **multi_modal_inputs,
                             use_cache=False,
                             **{
@@ -501,6 +505,15 @@ class DataParallelPPOActor(BasePPOActor):
                         all_entropy = output.entropy.squeeze(0) if output.entropy is not None else None
                         shared_logits = output.shared_logits
 
+                        if self.use_ulysses_sp:
+                            all_log_probs = gather_outputs_and_unpad(
+                                all_log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size,
+                            )
+                            if all_entropy is not None:
+                                all_entropy = gather_outputs_and_unpad(
+                                    all_entropy, gather_dim=0, unpad_dim=0, padding_size=pad_size,
+                                )
+
                         log_probs, entropy, nan_mask = _dualkv_extract_logprobs_fused(
                             all_log_probs, all_entropy, shared_logits,
                             repack_info, response_length, batch_size,
@@ -509,15 +522,22 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     else:
                         output = self.actor_module(
-                            input_ids=input_ids_packed,
+                            input_ids=input_ids_rmpad,
                             attention_mask=None,
-                            position_ids=position_ids_packed,
+                            position_ids=position_ids_rmpad,
                             **multi_modal_inputs,
                             use_cache=False,
                             **{**extra_args, "dualkv_context": dualkv_ctx},
                         )
 
-                        logits_packed = output.logits.squeeze(0)
+                        logits_packed = output.logits.squeeze(0)  # (T/sp, vocab) or (T, vocab)
+                        if self.use_ulysses_sp:
+                            logits_packed = gather_outputs_and_unpad(
+                                logits_packed,
+                                gather_dim=0,
+                                unpad_dim=0,
+                                padding_size=pad_size,
+                            )
                         log_probs, entropy, nan_mask = _dualkv_extract_logprobs(
                             logits_packed, repack_info, response_length, batch_size,
                             temperature, calculate_entropy,
