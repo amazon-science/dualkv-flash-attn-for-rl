@@ -58,7 +58,9 @@ pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
 ```bash
 cd flash-attention
-pip install -e .
+pip install ninja numpy packaging
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git csrc/cutlass
+pip install -e . --no-build-isolation
 cd ..
 ```
 
@@ -252,7 +254,7 @@ torchrun --nproc-per-node=2 experiments/test_dualkv_sp_correctness.py
 ```bibtex
 @inproceedings{dualkv2026,
   title={DualKV: Shared-Prompt Flash-Attention Kernels for Efficient Policy Updates in RL Training},
-  author={Gai, Jiading and others},
+  author={Gai, Jiading and Zhang, Shuai and Song, Xiang and Wang, Bernie and Karypis, George},
   booktitle={NeurIPS},
   year={2026}
 }
