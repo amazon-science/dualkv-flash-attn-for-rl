@@ -50,7 +50,7 @@ $PYTHON -m recipe.dapo.main_dapo \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    +actor_rollout_ref.actor.use_dualkv=False \
+    +actor_rollout_ref.model.use_dualkv=False \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
@@ -58,7 +58,6 @@ $PYTHON -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=32 \
-    +actor_rollout_ref.ref.use_dualkv=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     custom_reward_function.path=${REWARD_FN} \

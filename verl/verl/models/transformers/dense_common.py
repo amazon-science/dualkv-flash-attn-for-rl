@@ -24,7 +24,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 class CausalLMOutputForPPO(CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
-    shared_logits: Optional[torch.FloatTensor] = None
 
 
 def forward_base_model(
@@ -86,12 +85,16 @@ def forward_with_torch_backend(
     cache_position: Optional[torch.LongTensor] = None,
     logits_to_keep: int | torch.Tensor = 0,
     temperature: float = 1.0,
+    shift_labels: Optional[torch.LongTensor] = None,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
+    # DualKV: thread the shared-prompt context to the base model so it reaches the
+    # attention monkey-patch. HF Gemma4ForCausalLM.forward filters unknown kwargs, so
+    # without this re-injection dualkv_context is dropped at the model boundary and
+    # DualKV silently never runs. (Ported from gemma4-dev dense_common.)
     dualkv_context = loss_kwargs.pop("dualkv_context", None)
-    dualkv_shared_positions = loss_kwargs.pop("dualkv_shared_positions", None)
 
     model_kwargs = {}
     if dualkv_context is not None:
@@ -116,8 +119,13 @@ def forward_with_torch_backend(
     if not return_dict:
         raise NotImplementedError("forward_with_torch_backend has to return_dict")
 
-    # Loss calculations
-    if labels is not None:
+    # Loss calculations.
+    # When the engine has already prepared globally-rolled labels (e.g. the FSDP
+    # path under Ulysses SP, see issue #6068), it passes them as `shift_labels`
+    # so we don't redo `torch.roll` on a sequence-parallel-sliced shard.
+    if shift_labels is not None:
+        rolled_labels = shift_labels
+    elif labels is not None:
         rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
     elif input_ids is not None:
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
@@ -132,19 +140,9 @@ def forward_with_torch_backend(
         temperature=temperature,
     )
 
-    shared_logits = None
-    if dualkv_shared_positions is not None:
-        hs_flat = hidden_states.squeeze(0)
-        pos = dualkv_shared_positions
-        if not isinstance(pos, torch.Tensor):
-            pos = torch.tensor(pos, device=hs_flat.device, dtype=torch.long)
-        shared_hs = hs_flat[pos]
-        shared_logits = (shared_hs @ self.lm_head.weight.t()) / temperature
-
     return CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,
-        shared_logits=shared_logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -166,12 +164,13 @@ def forward_with_triton_backend(
     cache_position: Optional[torch.LongTensor] = None,
     logits_to_keep: int | torch.Tensor = 0,
     temperature: float = 1.0,
+    shift_labels: Optional[torch.LongTensor] = None,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
+    # DualKV: thread shared-prompt context to the base model (see torch backend above).
     dualkv_context = loss_kwargs.pop("dualkv_context", None)
-    dualkv_shared_positions = loss_kwargs.pop("dualkv_shared_positions", None)
 
     model_kwargs = {}
     if dualkv_context is not None:
@@ -197,8 +196,11 @@ def forward_with_triton_backend(
     if not return_dict:
         raise NotImplementedError("forward_with_triton_backend has to return_dict")
 
-    # Loss calculations
-    if labels is not None:
+    # Loss calculations. See `forward_with_torch_backend` for why `shift_labels`
+    # takes precedence over local `torch.roll` (issue #6068).
+    if shift_labels is not None:
+        rolled_labels = shift_labels
+    elif labels is not None:
         rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
     elif input_ids is not None:
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
@@ -213,19 +215,9 @@ def forward_with_triton_backend(
         "none",
     )
 
-    shared_logits = None
-    if dualkv_shared_positions is not None:
-        hs_flat = hidden_states.squeeze(0)
-        pos = dualkv_shared_positions
-        if not isinstance(pos, torch.Tensor):
-            pos = torch.tensor(pos, device=hs_flat.device, dtype=torch.long)
-        shared_hs = hs_flat[pos]
-        shared_logits = (shared_hs @ self.lm_head.weight.t()) / temperature
-
     return CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,
-        shared_logits=shared_logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

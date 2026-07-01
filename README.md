@@ -4,6 +4,59 @@ Code release for *["DualKV: Shared-Prompt Flash-Attention Kernels for Efficient 
 
 DualKV deduplicates shared prompts in GRPO/DAPO training — instead of computing attention over `N*(P+R)` tokens, it computes over `P + N*R`, yielding up to 6x kernel speedup and 2x end-to-end throughput on long-context RL workloads. This release includes the custom flash-attention kernels, veRL integration (with Ulysses Sequence Parallelism support), and scripts to reproduce all paper experiments.
 
+## Gemma 4 Support (`gemma4-dev` branch)
+
+> **The `main` branch reproduces the paper (Qwen3 models) and uses the stack in [Software Environment](#software-environment) below. Gemma 4 support lives on the `gemma4-dev` branch and requires a *different, separately-pinned* software environment — documented here.** Checking out `gemma4-dev` and following the `main` setup will not work.
+
+Gemma 4 adds: a **head-dim 512** DualKV kernel (global attention layers) and **kernel-native causal sliding-window attention** (sliding layers, `W=1024`), plus the veRL integration for the hybrid `Gemma4ForCausalLM` decoder (60 layers: 50 sliding hd256 / 10 global hd512, GQA, `attention_k_eq_v`).
+
+**Required environment** (do not substitute versions — these are co-pinned; in particular vLLM **0.19.1**, not a newer release):
+
+| Package | Version | Notes |
+|---------|---------|-------|
+| Python | 3.12 | |
+| PyTorch | 2.10.0+cu128 | torchvision 0.25.0, torchaudio 2.10.0 (hard-pinned by vLLM 0.19.1) |
+| CUDA | 12.8 | toolkit required to build the kernel; arch `90` (H100) |
+| flash-attn | included (with DualKV + hd512 + SWA) | rebuild against torch 2.10 |
+| veRL | 0.7.0 (included, with DualKV + Gemma4 integration) | |
+| vLLM | **0.19.1** | the Gemma4 [recipe](https://recipes.vllm.ai/Google/gemma-4-31B-it)-pinned version; newer (0.22) respawn-loops verl 0.7.0's rollout |
+| Transformers | 5.9.0 | Gemma 4 needs ≥5.6 |
+| Ray | 2.55.1 | |
+
+```bash
+git checkout gemma4-dev
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+# flash-attention (with DualKV hd512 + SWA kernels), built against torch 2.10
+cd flash-attention
+pip install ninja numpy packaging
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git csrc/cutlass
+FLASH_ATTN_CUDA_ARCHS=90 pip install -e . --no-build-isolation
+cd ..
+
+# veRL with DualKV + Gemma4 integration
+cd verl && pip install -e . && cd ..
+
+pip install vllm==0.19.1 transformers==5.9.0 ray==2.55.1 wandb pandas pyarrow
+```
+
+Verify the Gemma 4 kernels:
+
+```bash
+python flash-attention/tests/test_dualkv_swa_fwd.py   # sliding-window forward
+python flash-attention/tests/test_dualkv_swa_bwd.py   # sliding-window backward (incl. fp32 dKc/dVc)
+```
+
+Model + e2e GRPO/DAPO scripts:
+
+```bash
+huggingface-cli download google/gemma-4-31B-it --local-dir ${WORKDIR}/models/gemma-4-31B-it
+bash experiments/run_gemma4_31b_longreason_dualkv_sp1_50step_mb4.sh   # 2 nodes (16x H100)
+```
+
+> Known limitation: DualKV + Ulysses SP>1 on Gemma 4 is not yet supported (single-GPU-per-rank `SP=1` only); `mb=8` requires SP>1 and is pending that fix.
+
 ## Repository Structure
 
 ```

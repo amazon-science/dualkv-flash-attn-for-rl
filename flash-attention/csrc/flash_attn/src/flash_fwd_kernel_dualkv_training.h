@@ -42,7 +42,7 @@ using namespace cute;
 //   n < n_blocks_ctx  : n * kBlockN + col
 //   n >= n_blocks_ctx : context_seqlen + (n - n_blocks_ctx) * kBlockN + col
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_K, typename Params>
 inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -81,12 +81,26 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
 
     if (m_block * kBlockM >= actual_seqlen_q) return;
 
-    // n_block_max: total physical blocks we need to visit
+    // Maps a logical K position to the physical block index containing it,
+    // honoring the independent ctx/dec padding (context occupies logical
+    // [0, context_seqlen), decoded [context_seqlen, actual_seqlen_k)).
+    // Used for window/causal block-range pruning across the split layout.
+    auto logical_to_phys_block = [&](int k_logical) -> int {
+        if (k_logical < context_seqlen) {
+            return k_logical / kBlockN;
+        } else {
+            return n_blocks_ctx + (k_logical - context_seqlen) / kBlockN;
+        }
+    };
+
+    // n_block_max: total physical blocks we need to visit. n_block_min: first.
     int n_block_max = n_blocks_ctx + n_blocks_dec;
-    if (Is_causal) {
-        // Under causal with bottom-right alignment, Q position (m_block+1)*kBlockM - 1
-        // can attend to K positions 0..(m_block+1)*kBlockM - 1 + (seqlen_k - seqlen_q).
-        // The offset (seqlen_k - seqlen_q) is 0 for standard DualKV, P for SplitQ.
+    int n_block_min = 0;
+    if (Is_causal || Is_local) {
+        // Under bottom-right alignment the offset (seqlen_k - seqlen_q) is 0 for
+        // standard DualKV, P for SplitQ. The last (highest-index) Q row in this
+        // block is (m_block+1)*kBlockM - 1; the highest K it may attend is that
+        // plus the alignment offset (+ window_right, which is 0 for causal SWA).
         const int causal_k_needed = actual_seqlen_k - actual_seqlen_q + (m_block + 1) * kBlockM;
         int causal_n_max;
         if (causal_k_needed <= context_seqlen) {
@@ -96,9 +110,20 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
         }
         n_block_max = std::min(n_block_max, causal_n_max);
     }
+    if (Is_local) {
+        // Sliding window (left-window causal, window_right == 0). The LOWEST Q row
+        // in this block is m_block*kBlockM; it can attend back to logical K position
+        //   lo = m_block*kBlockM + (seqlen_k - seqlen_q) - window_left.
+        // K blocks entirely below `lo` are out of the band -> skip them.
+        const int lo = m_block * kBlockM + (actual_seqlen_k - actual_seqlen_q) - params.window_size_left;
+        if (lo > 0) {
+            const int clamped = std::min(lo, actual_seqlen_k - 1);
+            n_block_min = std::max(n_block_min, logical_to_phys_block(clamped));
+        }
+    }
 
     // Early exit: no K blocks to process
-    if (n_block_max <= 0) {
+    if (n_block_max <= n_block_min) {
         // Write zeros to O and inf to LSE
         const index_t row_offset_o = (params.cu_seqlens_q == nullptr ? bidb * params.o_batch_stride : sum_s_q * params.o_row_stride)
             + bidh * params.o_head_stride;
@@ -303,11 +328,17 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
     clear(acc_o);
 
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, /*Is_local=*/false, /*Has_alibi=*/false> mask(actual_seqlen_k, actual_seqlen_q, /*window_left=*/-1, /*window_right=*/0, /*alibi_slope=*/0.0f);
+    // Causal SWA is expressed as Is_local with window_right == 0 (the right edge
+    // becomes the causal cutoff col <= row); mask.h static_asserts !(Causal && Local),
+    // so we pass Is_causal=false when Is_local=true. For plain causal, Is_local=false.
+    FLASH_NAMESPACE::Mask<Is_causal && !Is_local, Is_local, /*Has_alibi=*/false> mask(
+        actual_seqlen_k, actual_seqlen_q,
+        /*window_left=*/Is_local ? params.window_size_left : -1,
+        /*window_right=*/0, /*alibi_slope=*/0.0f);
 
     // --- Main loop: iterate K/V blocks in reverse ---
     // Always use bounds-checked loads since context/decoded blocks have independent padding.
-    for (; n_block >= 0; --n_block) {
+    for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -331,18 +362,17 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
-        // Apply causal/bounds mask using LOGICAL K position
+        // Apply causal/window/bounds mask using LOGICAL K position.
+        // - Is_local: causal SWA. Mask was built with Is_local=true,window_right=0,
+        //   so apply_mask's Is_local branch enforces both the left window edge and
+        //   the (causal) right edge. Pass Causal_mask=false (static_assert forbids both).
+        // - Is_causal && !Is_local: plain causal.
+        // - neither: still mask OOB K positions.
         const int k_pos_base = get_k_pos(n_block);
-        if constexpr (Is_causal) {
-            mask.template apply_mask<Is_causal, /*Is_even_MN=*/false>(
-                acc_s, k_pos_base, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-            );
-        } else {
-            // For non-causal, still need to mask OOB K positions
-            mask.template apply_mask</*Causal_mask=*/false, /*Is_even_MN=*/false>(
-                acc_s, k_pos_base, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-            );
-        }
+        constexpr bool kCausalMaskArg = Is_causal && !Is_local;
+        mask.template apply_mask<kCausalMaskArg, /*Is_even_MN=*/false>(
+            acc_s, k_pos_base, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+        );
 
         // Per-block OOB masking: context and decoded blocks have independent
         // padding, so "ghost" positions within a block (K=0 but logically valid)
@@ -374,9 +404,9 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
         // Online softmax
         const bool is_first = (n_block == n_block_max - 1);
         if (is_first) {
-            softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal>(acc_s, acc_o, params.scale_softmax_log2);
+            softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
         } else {
-            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal>(acc_s, acc_o, params.scale_softmax_log2);
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
         }
 
         // Convert P to fp16 and accumulate O += P @ V
@@ -457,7 +487,7 @@ inline __device__ void compute_attn_1rowblock_dualkv_training(const Params &para
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Params>
 inline __device__ void compute_attn_dualkv_training(const Params &params) {
     const int m_block = blockIdx.x;
     const int bidb = blockIdx.y;
@@ -466,9 +496,9 @@ inline __device__ void compute_attn_dualkv_training(const Params &params) {
     // We always use Is_even_MN=false for DualKV (varlen, separate padding).
     // Dispatch Is_even_K at compile time.
     if (is_even_K) {
-        compute_attn_1rowblock_dualkv_training<Kernel_traits, Is_causal, /*Is_even_K=*/true>(params, bidb, bidh, m_block);
+        compute_attn_1rowblock_dualkv_training<Kernel_traits, Is_causal, Is_local, /*Is_even_K=*/true>(params, bidb, bidh, m_block);
     } else {
-        compute_attn_1rowblock_dualkv_training<Kernel_traits, Is_causal, /*Is_even_K=*/false>(params, bidb, bidh, m_block);
+        compute_attn_1rowblock_dualkv_training<Kernel_traits, Is_causal, Is_local, /*Is_even_K=*/false>(params, bidb, bidh, m_block);
     }
 }
 

@@ -69,7 +69,7 @@ make_tiled_copy_C_warpcontiguousN_dualkv(Copy_Atom<Args...> const& copy_atom, Ti
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_K, bool Is_first, bool Is_last, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_K, bool Is_first, bool Is_last, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock_dualkv_training(
     const Params &params, const int bidb, const int bidh, const int n_block)
 {
@@ -124,15 +124,34 @@ inline __device__ void compute_dq_dk_dv_1colblock_dualkv_training(
         ? n_block * kBlockN
         : context_seqlen + (n_block - n_blocks_ctx) * kBlockN;
 
-    // --- m_block_max: highest Q block that could attend to this K block ---
-    int m_block_max = cute::ceil_div(actual_seqlen_q, kBlockM);
-    // For causal, Q at position m can only attend to K at position <= m
-    // So K at position k_pos_base + kBlockN - 1 can only be attended by Q at position >= k_pos_base + kBlockN - 1
-    // And the last Q that could attend to us is actual_seqlen_q - 1
-    // m_block_max is already correct for non-causal
+    // --- Q-block range that could attend to this K block ---
+    // This is the transpose of the forward block-pruning. Using logical positions
+    // with the bottom-right alignment offset off = (seqlen_k - seqlen_q):
+    //   a K at logical position k is attended by query row q (logical) iff
+    //     causal:  q >= k - off                  (q + off >= k, i.e. col <= row)
+    //     window:  q <= k - off + window_left     (left window of size window_left)
+    // The highest K logical position in this block is k_pos_base + valid_k - 1.
+    const int off = actual_seqlen_k - actual_seqlen_q;
 
-    // m_block_min: for causal, this K block can only be attended by Q positions >= k_pos_base
-    int m_block_min = Is_causal
+    int m_block_max = cute::ceil_div(actual_seqlen_q, kBlockM);
+    if (Is_local) {
+        // Window upper edge: a query row q attends key k iff q <= k - off + window_left.
+        // The largest q that attends to ANY key in this block is set by the HIGHEST
+        // key position (k_pos_base + valid_k - 1) — use it so we never skip a block
+        // that legitimately contributes (block pruning must be conservative).
+        const int k_high = k_pos_base + valid_k - 1;
+        const int q_hi = (k_high - off) + params.window_size_left;
+        if (q_hi >= 0) {
+            m_block_max = std::min(m_block_max, cute::ceil_div(q_hi + 1, kBlockM));
+        } else {
+            m_block_max = 0;  // entire block is left of every query's window
+        }
+    }
+
+    // m_block_min: for causal/local, this K block is only attended by Q positions
+    // >= k_pos_base - off (i.e. logical query >= logical key). Same for both since
+    // the window only bounds from above; the causal lower edge is unchanged.
+    int m_block_min = (Is_causal || Is_local)
         ? std::max(0, (k_pos_base + actual_seqlen_q - actual_seqlen_k) / kBlockM)
         : 0;
 
@@ -475,7 +494,21 @@ inline __device__ void compute_dq_dk_dv_1colblock_dualkv_training(
 
         // Apply mask using LOGICAL K position
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
-        if constexpr (Is_causal) {
+        if constexpr (Is_local) {
+            // Causal sliding-window: causal right edge (window_size_right == 0) plus
+            // a left window of params.window_size_left, keyed on logical K position.
+            // Out-of-band scores become -inf -> P == 0 -> dS == 0, so out-of-window
+            // query rows contribute exactly zero to acc_dk/acc_dv (and thus to the
+            // fp32 atomic dKc/dVc accumulation below). No change to the accumulator.
+            FLASH_NAMESPACE::apply_mask_local(scores,
+                k_pos_base + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                actual_seqlen_k,
+                m_blk * kBlockM + get<0>(taccScS_row(0)),
+                actual_seqlen_q,
+                AtomLayoutMS * 16,
+                params.window_size_left,
+                /*window_size_right=*/0);
+        } else if constexpr (Is_causal) {
             // Causal mask: Q at position q_pos can attend to K at position <= q_pos
             // Use logical K position (k_pos_base) for correct masking
             FLASH_NAMESPACE::apply_mask_causal(scores,
@@ -697,7 +730,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_dualkv_training(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel_dualkv_training(const Params &params) {
     const int bidb = blockIdx.y;
     const int bidh = blockIdx.z;
@@ -712,19 +745,19 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel_dualkv_training(const Para
 
     for (int n_block = blockIdx.x; n_block < n_blocks_total; n_block += gridDim.x) {
         // Use Is_first=false, Is_last=false since we always use Seq_parallel (atomicAdd for dQ)
-        compute_dq_dk_dv_1colblock_dualkv_training<Kernel_traits, Is_causal, Is_even_K, false, false>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock_dualkv_training<Kernel_traits, Is_causal, Is_local, Is_even_K, false, false>(params, bidb, bidh, n_block);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Params>
 inline __device__ void compute_dq_dk_dv_dualkv_training(const Params &params) {
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     if (is_even_K) {
-        compute_dq_dk_dv_seqk_parallel_dualkv_training<Kernel_traits, Is_causal, /*Is_even_K=*/true>(params);
+        compute_dq_dk_dv_seqk_parallel_dualkv_training<Kernel_traits, Is_causal, Is_local, /*Is_even_K=*/true>(params);
     } else {
-        compute_dq_dk_dv_seqk_parallel_dualkv_training<Kernel_traits, Is_causal, /*Is_even_K=*/false>(params);
+        compute_dq_dk_dv_seqk_parallel_dualkv_training<Kernel_traits, Is_causal, Is_local, /*Is_even_K=*/false>(params);
     }
 }
 

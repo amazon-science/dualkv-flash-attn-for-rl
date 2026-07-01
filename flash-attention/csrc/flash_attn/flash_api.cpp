@@ -1477,7 +1477,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 void run_mha_dualkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
-        HEADDIM_SWITCH(params.d, [&] {
+        HEADDIM_SWITCH_DUALKV(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 run_mha_fwd_dualkv_<elem_type, kHeadDim, Is_causal>(params, stream);
             });
@@ -1498,7 +1498,8 @@ mha_dualkv_varlen_fwd(at::Tensor &q,              // total_q x num_heads x head_
                       const int context_seqlen,    // shared context length (same for all seqs)
                       const int max_seqlen_k_decoded,
                       const float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+                      int window_size_left) {       // -1 = no window (full causal); >=0 = causal SWA
 
     at::cuda::CUDAGuard device_guard{q.device()};
 
@@ -1534,9 +1535,16 @@ mha_dualkv_varlen_fwd(at::Tensor &q,              // total_q x num_heads x head_
     const int num_heads_k = k_context.size(1);
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size <= 512, "DualKV forward supports head dimension at most 512");
     TORCH_CHECK(head_size % 8 == 0, "head_size must be a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    // Sliding-window (causal SWA) constraints. All DualKV use cases are causal,
+    // and only sliding (hd<=256) layers are windowed; global hd512 layers are
+    // full-attention. Guard so out-of-scope calls fail readably.
+    const bool is_local = window_size_left >= 0;
+    TORCH_CHECK(!is_local || is_causal, "DualKV sliding-window attention requires is_causal=true (window_right is 0)");
+    TORCH_CHECK(!is_local || head_size <= 256, "DualKV sliding-window attention supports head dimension at most 256");
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);
     CHECK_SHAPE(k_context, context_seqlen, num_heads_k, head_size);
@@ -1581,12 +1589,21 @@ mha_dualkv_varlen_fwd(at::Tensor &q,              // total_q x num_heads x head_
                      softmax_lse.data_ptr(),
                      0.0f,
                      softmax_scale,
-                     -1,
+                     window_size_left,
                      is_causal ? 0 : -1,
                      0.0f,
                      false,
                      true);
     params.total_q = total_q;
+
+    // set_params_fprop derives is_causal purely from the window args
+    // (is_causal = window_left < 0 && window_right == 0), which clears it
+    // whenever a finite left window is set. DualKV needs causal SWA = causal
+    // mask + left window, so restore the caller's intent explicitly. The kernel
+    // dispatches Is_local on (window_size_left >= 0) and Is_causal on this flag.
+    params.is_causal = is_causal;
+    params.window_size_left = window_size_left;
+    params.window_size_right = 0;
 
     params.use_dualkv_attention = true;
 
@@ -1617,7 +1634,7 @@ mha_dualkv_varlen_fwd(at::Tensor &q,              // total_q x num_heads x head_
 
 void run_mha_dualkv_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
-        HEADDIM_SWITCH(params.d, [&] {
+        HEADDIM_SWITCH_DUALKV(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 run_mha_bwd_dualkv_<elem_type, kHeadDim, Is_causal>(params, stream);
             });
@@ -1645,7 +1662,8 @@ mha_dualkv_varlen_bwd(const at::Tensor &dout,
                       const int context_seqlen,
                       const int max_seqlen_k_decoded,
                       const float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+                      int window_size_left) {       // -1 = no window (full causal); >=0 = causal SWA
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1668,6 +1686,11 @@ mha_dualkv_varlen_bwd(const at::Tensor &dout,
     const int num_heads = q.size(1);
     const int head_size = q.size(2);
     const int num_heads_k = k_context.size(1);
+
+    // Sliding-window (causal SWA) constraints, mirroring the forward.
+    const bool is_local = window_size_left >= 0;
+    TORCH_CHECK(!is_local || is_causal, "DualKV sliding-window backward requires is_causal=true (window_right is 0)");
+    TORCH_CHECK(!is_local || head_size <= 256, "DualKV sliding-window backward supports head dimension at most 256");
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
@@ -1717,12 +1740,22 @@ mha_dualkv_varlen_bwd(const at::Tensor &dout,
                      softmax_d.data_ptr(),
                      0.0f,
                      softmax_scale,
-                     -1,
+                     window_size_left,
                      is_causal ? 0 : -1,
                      0.0f,
                      false,
                      true);
     params.total_q = total_q;
+
+    // Same as the forward: set_params_dgrad derives is_causal from the window
+    // args and clears it when a left window is set, so restore the caller's
+    // intent. Causal SWA = causal mask + left window, window_right == 0. The
+    // windowed mask zeroes out-of-band scores, so out-of-window query rows
+    // contribute exactly zero to the fp32-atomic dKc/dVc accumulation (the
+    // accumulation path itself is unchanged and stays full fp32).
+    params.is_causal = is_causal;
+    params.window_size_left = window_size_left;
+    params.window_size_right = 0;
 
     params.use_dualkv_attention = true;
 

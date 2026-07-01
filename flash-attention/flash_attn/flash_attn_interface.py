@@ -1644,6 +1644,7 @@ class FlashAttnDualKVVarlenFunc(torch.autograd.Function):
         max_seqlen_k_decoded,
         softmax_scale,
         causal,
+        window_size_left,
         is_grad_enabled,
     ):
         is_grad = is_grad_enabled and any(
@@ -1672,6 +1673,7 @@ class FlashAttnDualKVVarlenFunc(torch.autograd.Function):
             max_seqlen_k_decoded,
             softmax_scale,
             causal,
+            window_size_left,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1683,6 +1685,7 @@ class FlashAttnDualKVVarlenFunc(torch.autograd.Function):
             ctx.max_seqlen_k_decoded = max_seqlen_k_decoded
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
+            ctx.window_size_left = window_size_left
         return out[..., :head_size_og]
 
     @staticmethod
@@ -1722,13 +1725,17 @@ class FlashAttnDualKVVarlenFunc(torch.autograd.Function):
             ctx.max_seqlen_k_decoded,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.window_size_left,
         )
         dq = dq[..., :head_size_og]
         dk_context = dk_context[..., :head_size_og]
         dv_context = dv_context[..., :head_size_og]
         dk_decoded = dk_decoded[..., :head_size_og]
         dv_decoded = dv_decoded[..., :head_size_og]
-        return dq, dk_context, dv_context, dk_decoded, dv_decoded, None, None, None, None, None, None, None, None
+        # Grads for: q, k_context, v_context, k_decoded, v_decoded, cu_seqlens_q,
+        # cu_seqlens_k_decoded, max_seqlen_q, context_seqlen, max_seqlen_k_decoded,
+        # softmax_scale, causal, window_size_left, is_grad_enabled
+        return dq, dk_context, dv_context, dk_decoded, dv_decoded, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_dualkv_varlen_func(
@@ -1744,11 +1751,21 @@ def flash_attn_dualkv_varlen_func(
     max_seqlen_k_decoded,
     softmax_scale=None,
     causal=False,
+    window_size_left=-1,
 ):
     """DualKV flash attention for training with variable-length sequences.
 
     Context KV is shared across all sequences in the batch (shape: context_seqlen, nheads_k, headdim).
     Decoded KV is per-sequence, packed with cu_seqlens (shape: total_k_decoded, nheads_k, headdim).
+
+    window_size_left: -1 for full causal attention; >= 0 enables causal sliding-window
+        attention (SWA) with the given left window (each query attends to at most
+        window_size_left preceding keys, in logical [context; decoded] order).
+        Requires causal=True and head_dim <= 256. The right window is always 0
+        (causal). A query at logical position p attends to logical keys in
+        [p - window_size_left, p]. Both forward and backward support SWA; the
+        shared-context gradients (dKc/dVc) use full fp32 atomic accumulation and
+        only receive contributions from in-window query rows.
     """
     return FlashAttnDualKVVarlenFunc.apply(
         q,
@@ -1763,5 +1780,6 @@ def flash_attn_dualkv_varlen_func(
         max_seqlen_k_decoded,
         softmax_scale,
         causal,
+        window_size_left,
         torch.is_grad_enabled(),
     )

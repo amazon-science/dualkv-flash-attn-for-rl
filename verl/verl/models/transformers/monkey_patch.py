@@ -33,6 +33,44 @@ from verl.utils.ulysses import (
     slice_input_tensor,
 )
 
+_PREFIX_GROUPER_PATCHED = False
+_PREFIX_GROUPER_SUPPORTED_ATTENTIONS = {"flash_attention_2", "flash_attention_3", "sdpa", "flex_attention", "eager"}
+
+
+def _create_prefix_grouper_wrapper(original_fn):
+    """Wrap attention function to support prefix_grouper in kwargs."""
+
+    def wrapped(module, query, key, value, attention_mask, *args, **kwargs):
+        prefix_grouper = kwargs.pop("prefix_grouper", None)
+        if prefix_grouper is None:
+            return original_fn(module, query, key, value, attention_mask, *args, **kwargs)
+
+        def attn_func(q, k, v, attn_mask, *inner_args, **inner_kwargs):
+            out, _ = original_fn(module, q, k, v, attn_mask, *inner_args, **inner_kwargs)
+            return out
+
+        return prefix_grouper.forward(attn_func, query, key, value, *args, **kwargs), None
+
+    return wrapped
+
+
+def apply_prefix_grouper_patch():
+    """Patch ALL_ATTENTION_FUNCTIONS to support prefix_grouper parameter."""
+    global _PREFIX_GROUPER_PATCHED
+    if _PREFIX_GROUPER_PATCHED:
+        return
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    patched = []
+    for name in list(ALL_ATTENTION_FUNCTIONS.keys()):
+        if name in _PREFIX_GROUPER_SUPPORTED_ATTENTIONS:
+            ALL_ATTENTION_FUNCTIONS[name] = _create_prefix_grouper_wrapper(ALL_ATTENTION_FUNCTIONS[name])
+            patched.append(name)
+
+    _PREFIX_GROUPER_PATCHED = True
+    print(f"[PrefixGrouper] Patched: {patched}")
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -115,88 +153,6 @@ def _ulysses_flash_attention_forward(
         attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2)
 
     return attn_output
-
-
-def _make_dualkv_flash_wrapper(original_fn):
-    """Wrap flash attention forward to handle DualKV optimal prompt separation.
-
-    When dualkv_context is present in kwargs, splits Q/K/V at the prompt boundary
-    and uses context FA (once) + DualKV kernel (per-sequence decoded attention).
-    Otherwise delegates to the original flash attention function unchanged.
-
-    Supports Ulysses SP: when SP > 1, performs all-to-all to reconstruct the full
-    token sequence (with partial heads) before running the DualKV kernel, then
-    scatters back after.
-    """
-
-    def _dualkv_flash_forward(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs):
-        dualkv_context = kwargs.pop("dualkv_context", None)
-        if dualkv_context is None:
-            return original_fn(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs)
-
-        from flash_attn import flash_attn_dualkv_varlen_func, flash_attn_varlen_func
-
-        sp_size = get_ulysses_sequence_parallel_world_size()
-
-        # --- Ulysses pre-attention: gather sequence, scatter heads ---
-        if sp_size > 1:
-            repeats = max(sp_size // key_states.size(2), 1)
-            if repeats > 1:
-                key_states = key_states.repeat(1, 1, repeats, 1)
-                value_states = value_states.repeat(1, 1, repeats, 1)
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
-
-        # Q, K, V are (1, T, H/sp, hdim) when SP>1, or (1, T, H, hdim) when SP=1
-        q = query_states.squeeze(0)
-        k = key_states.squeeze(0)
-        v = value_states.squeeze(0)
-
-        softmax_scale = kwargs.get("softmax_scale", None)
-        group_info = dualkv_context["group_info"]
-        out_parts = []
-
-        for g in group_info:
-            P = g["prompt_len"]
-            ps = g["prompt_start"]
-            ds = g["dec_start"]
-            de = g["dec_end"]
-
-            q_ctx, k_ctx, v_ctx = q[ps : ps + P], k[ps : ps + P], v[ps : ps + P]
-            q_dec, k_dec, v_dec = q[ds:de], k[ds:de], v[ds:de]
-
-            cu_ctx = torch.tensor([0, P], device=q.device, dtype=torch.int32)
-            ctx_out = flash_attn_varlen_func(
-                q_ctx, k_ctx, v_ctx, cu_ctx, cu_ctx, P, P,
-                softmax_scale=softmax_scale, causal=True,
-                deterministic=True,
-            )
-
-            cu_dec = g["cu_seqlens_dec"]
-            max_dec = g["max_decoded"]
-            dec_out = flash_attn_dualkv_varlen_func(
-                q_dec, k_ctx, v_ctx, k_dec, v_dec,
-                cu_dec, cu_dec,
-                max_seqlen_q=max_dec,
-                context_seqlen=P,
-                max_seqlen_k_decoded=max_dec,
-                softmax_scale=softmax_scale,
-                causal=True,
-            )
-
-            out_parts.append(ctx_out)
-            out_parts.append(dec_out)
-
-        out = torch.cat(out_parts, dim=0).unsqueeze(0)  # (1, T, H/sp, hdim)
-
-        # --- Ulysses post-attention: gather heads, scatter sequence ---
-        if sp_size > 1:
-            out = gather_heads_scatter_seq(out, seq_dim=1, head_dim=2)
-
-        return out
-
-    return _dualkv_flash_forward
 
 
 def patch_vlm_for_ulysses_input_slicing(model_class: type):
@@ -311,6 +267,11 @@ def patch_forward_with_backends(
 
         forward_with_torch_backend_function = forward_with_torch_backend
         forward_with_triton_backend_function = forward_with_triton_backend
+    elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
+        from verl.models.transformers.qwen3_5 import forward_with_torch_backend, forward_with_triton_backend
+
+        forward_with_torch_backend_function = forward_with_torch_backend
+        forward_with_triton_backend_function = forward_with_triton_backend
     else:
         from verl.models.transformers.dense_common import forward_with_torch_backend, forward_with_triton_backend
 
@@ -327,17 +288,129 @@ def patch_forward_with_backends(
         raise ValueError(f"Unsupported fused_kernels_backend: {fused_kernels_backend}. Choose 'triton' or 'torch'.")
 
 
+
+# ===== DualKV shared-prompt flash wrapper (ported from verl 0.7.0) =====
+def _make_dualkv_flash_wrapper(original_fn):
+    """Wrap flash attention forward to handle DualKV optimal prompt separation.
+
+    When dualkv_context is present in kwargs, splits Q/K/V at the prompt boundary
+    and uses context FA (once) + DualKV kernel (per-sequence decoded attention).
+    Otherwise delegates to the original flash attention function unchanged.
+
+    Supports Ulysses SP: when SP > 1, performs all-to-all to reconstruct the full
+    token sequence (with partial heads) before running the DualKV kernel, then
+    scatters back after.
+    """
+
+    def _dualkv_flash_forward(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs):
+        dualkv_context = kwargs.pop("dualkv_context", None)
+        if dualkv_context is None:
+            return original_fn(query_states, key_states, value_states, attention_mask, query_length, *args, **kwargs)
+
+        from flash_attn import flash_attn_dualkv_varlen_func, flash_attn_varlen_func
+
+        sp_size = get_ulysses_sequence_parallel_world_size()
+
+        # --- Ulysses pre-attention: gather sequence, scatter heads ---
+        if sp_size > 1:
+            repeats = max(sp_size // key_states.size(2), 1)
+            if repeats > 1:
+                key_states = key_states.repeat(1, 1, repeats, 1)
+                value_states = value_states.repeat(1, 1, repeats, 1)
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2)
+            key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
+
+        # Q, K, V are (1, T, H/sp, hdim) when SP>1, or (1, T, H, hdim) when SP=1
+        q = query_states.squeeze(0)
+        k = key_states.squeeze(0)
+        v = value_states.squeeze(0)
+
+        softmax_scale = kwargs.get("softmax_scale", None)
+        group_info = dualkv_context["group_info"]
+        out_parts = []
+
+        # Per-layer attention geometry. Gemma4 interleaves sliding-window (hd=256,
+        # window W) and global (hd=512, full-attn) layers. Both now run through the
+        # DualKV kernel, which supports causal sliding-window for hd<=256:
+        #   - global / full-attn layers  -> DualKV with window_size_left=-1 (full causal).
+        #   - sliding-window layers       -> DualKV with window_size_left=sw-1, so the
+        #     decoded queries attend [ctx; own-response] WITHIN the window in a SINGLE
+        #     packed kernel call (P + N*R tokens), instead of the FA2 fallback that
+        #     replicated the prompt N times ([ctx;resp_i] per response, N*(P+R) tokens).
+        # Call1 (prompt self-attn) uses the DualKV kernel with context_seqlen=0 (empty
+        # context), windowed for sliding layers; this also bypasses FA2's hd<=256 cap
+        # on the global (hd=512) layers.
+        head_dim = q.shape[-1]
+        sw = kwargs.get("sliding_window", None)
+        is_sliding = sw is not None and sw > 0
+        window_left = (sw - 1) if is_sliding else -1
+
+        for g in group_info:
+            P = g["prompt_len"]
+            ps = g["prompt_start"]
+            ds = g["dec_start"]
+            de = g["dec_end"]
+
+            q_ctx, k_ctx, v_ctx = q[ps : ps + P], k[ps : ps + P], v[ps : ps + P]
+            q_dec, k_dec, v_dec = q[ds:de], k[ds:de], v[ds:de]
+            cu_dec = g["cu_seqlens_dec"]
+            max_dec = g["max_decoded"]
+
+            # Call1: prompt self-attention via empty-context DualKV (windowed for
+            # sliding layers). Logical positions are 0..P-1; query p attends
+            # [p-window_left, p].
+            cu_ctx = torch.tensor([0, P], device=q.device, dtype=torch.int32)
+            empty_k = k_ctx.new_zeros(0, *k_ctx.shape[1:])
+            empty_v = v_ctx.new_zeros(0, *v_ctx.shape[1:])
+            ctx_out = flash_attn_dualkv_varlen_func(
+                q_ctx, empty_k, empty_v, k_ctx, v_ctx, cu_ctx, cu_ctx,
+                max_seqlen_q=P, context_seqlen=0, max_seqlen_k_decoded=P,
+                softmax_scale=softmax_scale, causal=True, window_size_left=window_left,
+            )
+            # Call2: decoded queries attend to [ctx; own-response]. Each response is a
+            # separate sequence (cu_dec); shared prompt K/V passed ONCE (no replication).
+            # Logical positions are [ctx 0..P-1; decoded P..P+R-1]; the window
+            # (window_size_left=sw-1) is applied in that logical order, so a decoded
+            # token at logical P+r attends the last sw tokens spanning the prompt tail
+            # and its own response so far -- identical to the FA2 [ctx;resp_i] semantics.
+            dec_out = flash_attn_dualkv_varlen_func(
+                q_dec, k_ctx, v_ctx, k_dec, v_dec,
+                cu_dec, cu_dec,
+                max_seqlen_q=max_dec,
+                context_seqlen=P,
+                max_seqlen_k_decoded=max_dec,
+                softmax_scale=softmax_scale,
+                causal=True, window_size_left=window_left,
+            )
+
+            out_parts.append(ctx_out)
+            out_parts.append(dec_out)
+
+        out = torch.cat(out_parts, dim=0).unsqueeze(0)  # (1, T, H/sp, hdim)
+
+        # --- Ulysses post-attention: gather heads, scatter sequence ---
+        if sp_size > 1:
+            out = gather_heads_scatter_seq(out, seq_dim=1, head_dim=2)
+
+        return out
+
+    return _dualkv_flash_forward
+# ===== end DualKV wrapper =====
+
+
 def apply_monkey_patch(
     model: PreTrainedModel,
     ulysses_sp_size: int = 1,
     use_remove_padding: bool = True,
     use_fused_kernels: bool = False,
     fused_kernels_backend: str = None,
+    use_prefix_grouper: bool = False,
     use_tiled_mlp: bool = False,
     tiled_mlp_shards: int = 4,
 ):
     """
-    Apply monkey patch to the models for ulysses sequence parallel, fused kernel, and tiled MLP.
+    Apply monkey patch to the models for ulysses sequence parallel, fused kernel, tiled MLP and prefix grouper.
 
     In the end of this function forward function of the model is patched for fused kernel.
     If the model is not supported with fused kernel, please return after patch.
@@ -358,6 +431,9 @@ def apply_monkey_patch(
 
         model_type = getattr(model.config, "model_type", None)
         apply_tiled_mlp_monkey_patch(num_shards=tiled_mlp_shards, model_type=model_type)
+    # Apply PrefixGrouper patch if enabled
+    if use_prefix_grouper:
+        apply_prefix_grouper_patch()
 
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]
@@ -380,7 +456,10 @@ def apply_monkey_patch(
     )
 
     if is_trl_available():
-        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        try:
+            from trl.experimental.ppo import AutoModelForCausalLMWithValueHead  # type: ignore
+        except ImportError:
+            from trl import AutoModelForCausalLMWithValueHead  # type: ignore
 
         def state_dict(self, *args, **kwargs):
             return torch.nn.Module.state_dict(self, *args, **kwargs)
@@ -449,14 +528,17 @@ def apply_monkey_patch(
             Qwen3VLForConditionalGeneration,
             Qwen3VLModel,
             Qwen3VLTextModel,
+            Qwen3VLVisionModel,
         )
         from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
             Qwen3VLMoeForConditionalGeneration,
             Qwen3VLMoeModel,
             Qwen3VLMoeTextModel,
+            Qwen3VLMoeVisionModel,
         )
 
         from verl.models.transformers.qwen3_vl import (
+            fast_pos_embed_interpolate,
             forward_with_normal_backend,
             patch_qwen3_vl_moe_sparse_moe_block_forward,
             qwen3_vl_base_forward,
@@ -466,6 +548,8 @@ def apply_monkey_patch(
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         Qwen3VLForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3VLMoeForConditionalGeneration.forward = forward_with_normal_backend
+        Qwen3VLMoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+        Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
         print(f"Monkey patch {model.__class__.__name__} model forward")
 
         # Step 1.5: patch Qwen3VLMoeTextSparseMoeBlock to fix transformers 4.57.3 bug
@@ -519,6 +603,39 @@ def apply_monkey_patch(
             print("Not support fused kernels for KimiVL")
 
         return
+    elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
+        # Step 1: patch model to support image-text mixed data
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+            Qwen3_5Model,
+            Qwen3_5TextModel,
+            Qwen3_5VisionModel,
+        )
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeForConditionalGeneration,
+            Qwen3_5MoeModel,
+            Qwen3_5MoeTextModel,
+            Qwen3_5MoeVisionModel,
+        )
+
+        from verl.models.transformers.qwen3_5 import (
+            fast_pos_embed_interpolate,
+            forward_with_normal_backend,
+            qwen3_5_base_forward,
+        )
+
+        Qwen3_5Model.forward = qwen3_5_base_forward
+        Qwen3_5MoeModel.forward = qwen3_5_base_forward
+        Qwen3_5ForConditionalGeneration.forward = forward_with_normal_backend
+        Qwen3_5MoeForConditionalGeneration.forward = forward_with_normal_backend
+        print(f"Monkey patch {model.__class__.__name__} model forward")
+
+        # Step 2: patch vision model to fix fsdp2 cpu_offload bug.
+        Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+        Qwen3_5MoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+        if ulysses_sp_size > 1:
+            patch_vlm_for_ulysses_input_slicing(Qwen3_5TextModel)
+            patch_vlm_for_ulysses_input_slicing(Qwen3_5MoeTextModel)
 
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models
@@ -532,13 +649,14 @@ def apply_monkey_patch(
 
         # DualKV wrapper: intercepts dualkv_context kwarg for optimal prompt separation.
         # Zero overhead when dualkv_context is not present in kwargs.
+        from transformers.integrations import flash_attention as _fa_mod
         _dualkv_wrapper = _make_dualkv_flash_wrapper(
             module._flash_attention_forward if hasattr(module, "_flash_attention_forward")
-            else flash_attention._flash_attention_forward
+            else _fa_mod._flash_attention_forward
         )
         if hasattr(module, "_flash_attention_forward"):
             module._flash_attention_forward = _dualkv_wrapper
         else:
-            flash_attention._flash_attention_forward = _dualkv_wrapper
+            _fa_mod._flash_attention_forward = _dualkv_wrapper
 
     patch_forward_with_backends(model, use_fused_kernels=use_fused_kernels, fused_kernels_backend=fused_kernels_backend)

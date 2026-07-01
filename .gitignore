@@ -38,3 +38,4 @@ wandb/
 flash-attention/build/
 flash-attention/*.egg-info/
 flash-attention/csrc/cutlass/
+docs/gemma4_dualkv_tutorial.html

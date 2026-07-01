@@ -41,6 +41,17 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    if str(data_source) == "longreason":
+        _ans = solution_str
+        _i = _ans.lower().rfind("the answer is")
+        _pred = ""
+        if _i != -1:
+            for _ch in _ans[_i + len("the answer is"):]:
+                if _ch in "ABCDEabcde":
+                    _pred = _ch.upper()
+                    break
+        _gt = ground_truth.strip() if isinstance(ground_truth, str) else str(ground_truth).strip()
+        return 1.0 if _pred == _gt.upper() else 0.0
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
@@ -130,6 +141,11 @@ def _default_compute_score(
     return default_compute_score(
         data_source, solution_str, ground_truth, extra_info, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
     )
+
+
+def get_default_compute_score(reward_name: str | None):
+    """Get the default compute_score function based on the reward manager type."""
+    return default_compute_score
 
 
 __all__ = ["default_compute_score"]

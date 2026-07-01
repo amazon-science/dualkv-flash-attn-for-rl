@@ -51,16 +51,12 @@ tool_config:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.utils.profiler.config.TorchProfilerToolConfig
 
-    # start profile mini-batch in training
-    # NOTICE: different with global steps config which refers to iteration
-    # This field only related with mini-batch
-    step_start: 0
+    # Contents to profile, can be empty
+    # options: cuda, cpu, memory, shapes, stack
+    contents: []
 
-    # stop profile mini-batch in training
-    step_end: null
-
-    # manual save
-    manual_save: True
+    # True for each task has its own database, False for all tasks in one training step share one database.
+    discrete: false
 
     name: torch
 
@@ -75,3 +71,18 @@ tool_config:
     stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
 
     name: torch_memory
+
+  precision_debugger:
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+    # Path to msprobe config json
+    config_path: ${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}
+
+    # Deprecated and ignored. Use global_profiler.steps.
+    steps: null
+
+    # Profile stages
+    stages: ${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}
+
+    name: precision_debugger

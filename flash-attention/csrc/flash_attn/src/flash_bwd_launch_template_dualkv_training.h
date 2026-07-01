@@ -39,9 +39,9 @@ template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
 #endif
 
-DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_dualkv_training_kernel, bool Is_causal) {
+DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_dualkv_training_kernel, bool Is_causal, bool Is_local) {
     #if defined(ARCH_SUPPORTS_FLASH)
-        FLASH_NAMESPACE::compute_dq_dk_dv_dualkv_training<Kernel_traits, Is_causal>(params);
+        FLASH_NAMESPACE::compute_dq_dk_dv_dualkv_training<Kernel_traits, Is_causal, Is_local>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -94,7 +94,7 @@ __global__ void flash_bwd_convert_dkv_context_kernel(const Flash_bwd_params para
     }
 }
 
-template<typename Kernel_traits, bool Is_causal>
+template<typename Kernel_traits, bool Is_causal, bool Is_local>
 void run_flash_bwd_dualkv(Flash_bwd_params &params, cudaStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_BACKWARD
     // Step 1: Compute D = rowsum(dO * O) — reuse standard preprocess kernel
@@ -118,7 +118,7 @@ void run_flash_bwd_dualkv(Flash_bwd_params &params, cudaStream_t stream) {
     dim3 grid_n(gridDimx, params.b, params.h);
 
     constexpr int smem_size = Kernel_traits::kSmemSize1colblock;
-    auto kernel = &flash_bwd_dq_dk_dv_dualkv_training_kernel<Kernel_traits, Is_causal>;
+    auto kernel = &flash_bwd_dq_dk_dv_dualkv_training_kernel<Kernel_traits, Is_causal, Is_local>;
     if (smem_size >= 48 * 1024) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -145,31 +145,45 @@ void run_flash_bwd_dualkv(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 // --- Per-headdim dispatch ---
-// DualKV training bwd: no dropout, no alibi, no softcap, no local attention.
-// Use same block sizes as FA2 non-dropout backward.
+// DualKV training bwd: no dropout, no alibi, no softcap. Same block sizes as FA2
+// non-dropout backward.
+//
+// Causal sliding-window (SWA): for hd <= 256 dispatch a compile-time Is_local on
+// (window_size_left >= 0), ONLY under Is_causal (all DualKV use cases are causal;
+// right-window == 0). hd512 never gets a local instantiation (global layers are
+// full-attention; guarded in flash_api.cpp). Variadic macro so the commas inside
+// Flash_bwd_kernel_traits<...> are absorbed by __VA_ARGS__.
+#define DUALKV_BWD_LOCAL_DISPATCH(...)                                                \
+    if constexpr (Is_causal) {                                                       \
+        BOOL_SWITCH(params.window_size_left >= 0, Is_local, [&] {                    \
+            run_flash_bwd_dualkv<__VA_ARGS__, Is_causal, Is_local>(params, stream);  \
+        });                                                                          \
+    } else {                                                                         \
+        run_flash_bwd_dualkv<__VA_ARGS__, Is_causal, /*Is_local=*/false>(params, stream); \
+    }
 
 template<typename T, bool Is_causal>
 void run_mha_bwd_dualkv_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_causal>(params, stream);
+    DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_bwd_dualkv_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
-    run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_causal>(params, stream);
+    DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_bwd_dualkv_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_causal>(params, stream);
+    DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_bwd_dualkv_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
-    run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 4, false, false, T>, Is_causal>(params, stream);
+    DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 4, false, false, T>);
 }
 
 template<typename T, bool Is_causal>
@@ -184,12 +198,24 @@ void run_mha_bwd_dualkv_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
         C10_CUDA_CHECK(status_);
     }
     if (max_smem_per_block >= 176 * 1024) {  // H100
-        run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_causal>(params, stream);
+        DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>);
     } else if (max_smem_per_block >= 144 * 1024) {  // A100
-        run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>, Is_causal>(params, stream);
+        DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>);
     } else {  // sm86/sm89 (99 KB max smem): V in regs, no double buffer
-        run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, Is_causal>(params, stream);
+        DUALKV_BWD_LOCAL_DISPATCH(Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>);
     }
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_dualkv_hdim512(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 512;
+    int device; cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) { C10_CUDA_CHECK(status_); }
+    // d=512: tight SMEM/regs. Use Bm=64,Bn=32, V-in-regs + single-buffer to fit.
+    // hd512 = Gemma4 global (full-attention) layers only; never windowed.
+    run_flash_bwd_dualkv<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, Is_causal, /*Is_local=*/false>(params, stream);
 }
 
 }  // namespace FLASH_NAMESPACE

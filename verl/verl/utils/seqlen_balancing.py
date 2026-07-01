@@ -353,6 +353,7 @@ def rearrange_micro_batches(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    force_group_size=1,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -365,6 +366,7 @@ def rearrange_micro_batches(
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
+        force_group_size (int, optional): force consecutive samples to be in the same micro-batch (for RM training).
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -382,34 +384,78 @@ def rearrange_micro_batches(
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
+
+    # Validate force_group_size
+    batch_size = len(seq_len_effective)
+    assert batch_size % force_group_size == 0, (
+        f"Batch size {batch_size} must be divisible by force_group_size {force_group_size}"
+    )
+
     total_seqlen = seq_len_effective.sum().item()
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
-    num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
+    # When force_group_size > 1, we work with groups instead of individual samples
+    num_groups = batch_size // force_group_size
+    num_micro_batches = min(num_groups, ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:
         # used to support pp
         num_micro_batches = max(min_num_micro_batch, num_micro_batches)
-    if dist.is_initialized() and same_micro_num_in_dp:
+    if dist.is_initialized() and same_micro_num_in_dp and dp_group is not None:
         num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
         dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
     if num_batches_divided_by is not None:
         num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
 
-    assert num_micro_batches <= len(seq_len_effective)
+    assert num_micro_batches <= num_groups
 
-    # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
-    workloads = calculate_workload(seq_len_effective).cpu().tolist()
-    micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
+    # upcast to int64 to avoid potential overflow im `calculate_workload` computation.
+    seq_len_effective = seq_len_effective.long()
+
+    # When force_group_size > 1, aggregate workloads by groups
+    if force_group_size > 1:
+        # Calculate workload for each group (sum of workloads of samples in the group)
+        workloads_per_sample = calculate_workload(seq_len_effective)
+        workloads_per_sample_grouped = workloads_per_sample.view(num_groups, force_group_size)
+        group_workloads = workloads_per_sample_grouped.sum(dim=1).cpu().tolist()
+
+        # Partition groups instead of individual samples
+        micro_bsz_group_idx = get_seqlen_balanced_partitions(group_workloads, num_micro_batches, equal_size=False)
+
+        # Convert group indices back to sample indices
+        micro_bsz_idx = []
+        for group_partition in micro_bsz_group_idx:
+            sample_partition = []
+            for group_idx in group_partition:
+                start_idx = group_idx * force_group_size
+                sample_partition.extend(range(start_idx, start_idx + force_group_size))
+            micro_bsz_idx.append(sample_partition)
+
+        workloads = group_workloads
+    else:
+        # Original logic for force_group_size == 1
+        # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
+        workloads = calculate_workload(seq_len_effective).cpu().tolist()
+        micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
 
     if use_dynamic_bsz_balance:
         # Use the sum of squared sequence lengths to approximate attention computation workload
-        micro_bsz_idx.sort(
-            key=lambda partition: (
-                sum(workloads[idx] for idx in partition),
-                partition[0] if partition else 0,
-            ),
-            reverse=True,
-        )
+        if force_group_size > 1:
+            # For grouped samples, use group workloads for sorting
+            micro_bsz_idx.sort(
+                key=lambda partition: (
+                    sum(workloads[idx // force_group_size] for idx in partition[::force_group_size]),
+                    partition[0] if partition else 0,
+                ),
+                reverse=True,
+            )
+        else:
+            micro_bsz_idx.sort(
+                key=lambda partition: (
+                    sum(workloads[idx] for idx in partition),
+                    partition[0] if partition else 0,
+                ),
+                reverse=True,
+            )
         # Place smaller micro-batches at both ends to reduce the bubbles exposed during the warm-up and cool-down.
         micro_bsz_idx = micro_bsz_idx[::2][::-1] + micro_bsz_idx[1::2]
 
@@ -503,3 +549,78 @@ def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -
         reverted_data = data[revert_indices]
 
     return reverted_data
+
+
+def get_group_balanced_partitions(
+    seqlen_list: list[int],
+    uid_list: list,
+    k_partitions: int,
+) -> list[list[int]]:
+    """
+    Partition samples into k groups while keeping samples with the same uid together.
+
+    Args:
+        seqlen_list: List of sequence lengths for each sample.
+        uid_list: List of uids identifying which samples share the same prefix.
+                  Samples with the same uid will be kept together.
+        k_partitions: Number of partitions (typically world_size).
+
+    Returns:
+        List of k lists, each containing sample indices assigned to that partition.
+        Samples with the same uid are guaranteed to be in the same partition.
+    """
+    assert len(seqlen_list) == len(uid_list), "seqlen_list and uid_list must have same length"
+
+    # Build groups: each group contains indices of samples with the same uid
+    # Assumes samples with same uid are contiguous
+    groups = []  # List of (group_indices, group_total_seqlen)
+    current_uid = None
+    current_indices = []
+    current_seqlen = 0
+
+    for i, (seqlen, uid) in enumerate(zip(seqlen_list, uid_list, strict=False)):
+        if uid != current_uid:
+            if current_indices:
+                groups.append((current_indices, current_seqlen))
+            current_uid = uid
+            current_indices = [i]
+            current_seqlen = seqlen
+        else:
+            current_indices.append(i)
+            current_seqlen += seqlen
+
+    # Don't forget the last group
+    if current_indices:
+        groups.append((current_indices, current_seqlen))
+
+    num_groups = len(groups)
+    assert num_groups >= k_partitions, (
+        f"Number of uid groups ({num_groups}) must be >= k_partitions ({k_partitions}). "
+        f"Consider reducing world_size or increasing batch_size."
+    )
+
+    # Calculate workload for each group (as integers for partitioning)
+    group_workloads = []
+    for indices, total_seqlen in groups:
+        # Use sum of individual workloads for more accurate estimation
+        workload = sum(int(calculate_workload(torch.tensor([seqlen_list[i]])).item()) for i in indices)
+        group_workloads.append(workload)
+
+    # Use Karmarkar-Karp to partition groups
+    # equal_size=True ensures each partition gets the same number of groups,
+    # which is required when each group has the same number of samples (rollout.n)
+    group_partitions = get_seqlen_balanced_partitions(
+        seqlen_list=group_workloads,
+        k_partitions=k_partitions,
+        equal_size=True,
+    )
+
+    # Convert group partitions to sample partitions
+    sample_partitions = []
+    for group_partition in group_partitions:
+        sample_indices = []
+        for group_idx in group_partition:
+            sample_indices.extend(groups[group_idx][0])
+        sample_partitions.append(sorted(sample_indices))
+
+    return sample_partitions
