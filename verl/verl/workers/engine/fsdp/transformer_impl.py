@@ -1310,12 +1310,42 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     bs = int(cu_seqlens.numel() - 1)
                     uid_list = list(uids) if not isinstance(uids, torch.Tensor) else uids.tolist()
                     prompt_group_sizes = _compute_prompt_group_sizes(uid_list, bs)
-                    # per-group prompt length (actual tokens) from the nested prompts column
-                    prompt_lens_all = prompts.offsets().diff().tolist() if prompts.is_nested else None
+                    # Per-group prompt length P (one shared prompt per uid group). Derive P
+                    # PER ROW from reliable tensors only: P_i = seq_total_i - R_i, where
+                    # seq_total_i is the row's full [P;R] token count (from cu_seqlens) and
+                    # R_i is its response length (response_mask[i].sum()). This avoids threading
+                    # an integer non-tensor ('prompt_len') through DataProto/tensordict chunking,
+                    # which collapses per-row int arrays to a scalar (unlike object-dtype uid).
+                    seq_totals = cu_seqlens.diff().tolist()
+                    resp_mask = micro_batch.get("response_mask", None)
+                    assert resp_mask is not None and isinstance(resp_mask, torch.Tensor), (
+                        "DualKV: response_mask (Tensor [bs, resp_len]) required to derive per-row "
+                        f"prompt length; got {type(resp_mask).__name__}."
+                    )
+                    # per-row response token count (non-pad response positions)
+                    resp_lens = resp_mask.reshape(resp_mask.size(0), -1).sum(dim=1).tolist()
+                    assert len(resp_lens) == bs, (
+                        f"DualKV: response_mask has {len(resp_lens)} rows but bs={bs}."
+                    )
+                    per_row_P = [int(seq_totals[i]) - int(resp_lens[i]) for i in range(bs)]
                     prompt_lens = []
                     si = 0
                     for gsz in prompt_group_sizes:
-                        prompt_lens.append(int(prompt_lens_all[si]))
+                        _P = int(per_row_P[si])  # group members share one prompt; take first row's P
+                        assert 0 < _P < int(seq_totals[si]), (
+                            f"DualKV: derived prompt_len={_P} out of range for seq_total="
+                            f"{seq_totals[si]} (row {si}); resp_len={resp_lens[si]}."
+                        )
+                        # sanity: every row in this shared-prompt group must yield the same P
+                        for _j in range(si, si + gsz):
+                            _Pj = int(seq_totals[_j]) - int(resp_lens[_j])
+                            assert _Pj == _P, (
+                                f"DualKV: rows in uid-group starting at {si} disagree on prompt "
+                                f"length ({_P} vs {_Pj} at row {_j}); shared-prompt assumption "
+                                f"violated. seq_totals={seq_totals[si:si+gsz]} "
+                                f"resp_lens={resp_lens[si:si+gsz]}."
+                            )
+                        prompt_lens.append(_P)
                         si += gsz
                     pi = input_ids_rmpad  # (1, total_nnz) original packed-by-unpad
                     ppos = position_ids_rmpad
