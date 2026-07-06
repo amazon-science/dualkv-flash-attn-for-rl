@@ -1312,6 +1312,8 @@ class RayPPOTrainer:
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
+        if self.config.actor_rollout_ref.actor.get("use_dualkv", False):
+            shuffle = False  # DualKV requires same-prompt rollouts to stay contiguous
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
@@ -1499,11 +1501,30 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
+
+                    use_dualkv = self.config.actor_rollout_ref.actor.get("use_dualkv", False)
+                    if use_dualkv:
+                        # DualKV: skip balance_batch — it scatters same-prompt rollouts across
+                        # DP ranks. DualKV's _dualkv_repack already removes padding, so
+                        # seqlen balancing provides no benefit.
+                        n_rollouts = self.config.actor_rollout_ref.rollout.n
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        batch_size = len(batch.batch) // n_rollouts  # original prompt count
+                        assert batch_size % dp_size == 0, (
+                            f"DualKV requires batch_size ({batch_size}) divisible by dp_size ({dp_size}) "
+                            f"to guarantee complete prompt groups per GPU"
+                        )
+                        micro_bs = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                        assert micro_bs % n_rollouts == 0 or n_rollouts % micro_bs == 0, (
+                            f"DualKV requires ppo_micro_batch_size_per_gpu ({micro_bs}) and "
+                            f"n_rollouts ({n_rollouts}) to be divisible so each micro-batch "
+                            f"gets only same-prompt rollouts"
+                        )
+                    elif self.config.trainer.balance_batch:
+                        # Balance the number of valid tokens across DP ranks.
+                        # NOTE: This usually changes the order of data in the `batch`,
+                        # which won't affect the advantage calculation (since it's based on uid),
+                        # but might affect the loss calculation (due to the change of mini-batching).
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
