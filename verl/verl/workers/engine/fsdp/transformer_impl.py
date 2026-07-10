@@ -345,33 +345,57 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # ===== end DualKV helpers =====
 
 
-def _dualkv_unpack_logprobs(log_probs_packed, repack_info, orig_cu_seqlens):
-    """Map per-token log-probs computed over the PACKED layout [P, R1..RN] back to the
+def _dualkv_unpack_logprobs(log_probs_packed, repack_info, orig_cu_seqlens, shared_logits=None):
+    """Map per-token values computed over the PACKED layout [P, R1..RN] back to the
     ORIGINAL rmpad layout [P1 R1, ..., PN RN] so the result nests against the original
     input_ids.offsets() and the GRPO loss (which masks to response tokens) reads correct
-    per-response log-probs.
+    per-response values.
+
+    The shared prompt-last position P-1 predicts the FIRST token of EVERY response in the
+    group. In the packed stream that single position carries only ONE per-token value —
+    the one for the group's FIRST response (rolled_labels[P-1] == response-0's first
+    token). Copying that scalar to all N responses is WRONG for log_probs, because each
+    response's first token differs. So for log_probs we pass `shared_logits` (one full
+    logit row per group, from dense_common._dualkv_shared_logits) and recompute each
+    response's first-token log-prob as log_softmax(shared_logits[g])[first_response_token].
+    For entropy / Σπ² (properties of the shared distribution, independent of the label)
+    the scalar copy IS correct, so those callers pass shared_logits=None.
 
     Savings note: the model forward already ran over the PACKED P+N*R tokens (the DualKV
-    win); this is only a cheap O(total_nnz) gather of the resulting scalars.
+    win); this is only a cheap O(total_nnz) gather plus, when shared_logits is given, one
+    log_softmax per group (num_groups rows, not N*R).
     """
     import torch
     device = log_probs_packed.device
     total_orig = int(orig_cu_seqlens[-1].item())
     out = torch.zeros(total_orig, device=device, dtype=log_probs_packed.dtype)
     group_info = repack_info["group_info"]
+    first_response_tokens = repack_info["first_response_tokens"]
     seq_idx = 0
-    for g in group_info:
+    for group_idx, g in enumerate(group_info):
         P = g["prompt_len"]
         prompt_start = g["prompt_start"]
         cu_dec = g["cu_seqlens_dec"]
         dec_start = g["dec_start"]
+        # For log_probs: one full-vocab log-softmax per group (restore fp32 + NaN masking
+        # from the dead _dualkv_extract_logprobs_fused). None for entropy / Σπ².
+        shared_lsm = None
+        if shared_logits is not None:
+            vec = shared_logits[group_idx].float()
+            vec = torch.nan_to_num(vec, nan=0.0, posinf=1e4, neginf=-1e4)
+            shared_lsm = torch.log_softmax(vec, dim=-1)
         for i in range(g["n_seqs"]):
             R_i = g["response_lens"][i]
             o_start = int(orig_cu_seqlens[seq_idx].item())
             ps = dec_start + int(cu_dec[i].item())
             if R_i > 0:
                 # last prompt position (shared) predicts response[0]
-                out[o_start + P - 1] = log_probs_packed[prompt_start + P - 1]
+                if shared_lsm is not None:
+                    first_tok = first_response_tokens[seq_idx]
+                    fv = shared_lsm[first_tok]
+                    out[o_start + P - 1] = torch.nan_to_num(fv, nan=0.0).to(out.dtype)
+                else:
+                    out[o_start + P - 1] = log_probs_packed[prompt_start + P - 1]
                 if R_i > 1:
                     out[o_start + P : o_start + P + R_i - 1] = log_probs_packed[ps : ps + R_i - 1]
             seq_idx += 1
@@ -1244,6 +1268,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         # args used to get outputs
         output_args = {}
+        # DualKV: packed shared prompt-last positions; set only on the rmpad path below.
+        dualkv_shared_positions = None
 
         if use_remove_padding:
             # support per sample temperature
@@ -1275,8 +1301,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
             # gemma4-dev dp_actor flow (commit 02f0888) proven by test_dualkv_sp_correctness.py.
             dualkv_ctx = None
             dualkv_repack_info = None
+            dualkv_shared_positions = None
             use_dualkv = getattr(self.model_config, "use_dualkv", False)
             if use_dualkv:
+                # SP=1 ONLY. The fused DualKV log-prob path recomputes each response's first
+                # token from `shared_logits`, which is projected from the FULL, un-sliced
+                # packed hidden_states at the packed index prompt_start+P-1 (see
+                # dense_common._dualkv_shared_logits). Under Ulysses SP>1 the packed stream is
+                # sequence-sliced across ranks, so that global index would land on the wrong
+                # rank/token and silently corrupt the first-token log-prob. Fail loudly here
+                # rather than train on corrupted log-probs. (SP>1 support needs the shared
+                # position mapped into local shard coordinates + an all-gather; not done yet.)
+                assert self.ulysses_sequence_parallel_size == 1, (
+                    "DualKV (use_dualkv=True) currently requires ulysses_sequence_parallel_size==1. "
+                    f"Got sp={self.ulysses_sequence_parallel_size}. The fused first-token log-prob "
+                    "recompute indexes the full packed sequence, which SP>1 slices across ranks. "
+                    "Set ulysses_sequence_parallel_size=1 or disable use_dualkv."
+                )
                 # Gemma4-only guard: HF Gemma4ForCausalLM.forward does NOT pass arbitrary
                 # kwargs into self.model (unlike Qwen3, which threads **kwargs end-to-end),
                 # so dualkv_context only reaches attention via verl's replacement forward in
@@ -1374,6 +1415,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     temperature_rmpad = torch.cat(_t_parts).unsqueeze(0)  # (1, total_packed)
                     output_args["dualkv_repack_info"] = dualkv_repack_info
                     output_args["dualkv_orig_cu_seqlens"] = cu_seqlens
+                    # Packed index of each group's shared prompt-last token (predicts the
+                    # first response token for every response in the group). Threaded to the
+                    # fused forward so it can project just these rows through the LM head
+                    # (dense_common._dualkv_shared_logits). SP==1 asserted above, so these
+                    # indices address the full un-sliced packed stream directly.
+                    dualkv_shared_positions = [
+                        g["prompt_start"] + g["prompt_len"] - 1
+                        for g in dualkv_repack_info["group_info"]
+                    ]
 
             # pad and slice the inputs if sp > 1 (operates on the DualKV-packed tensors
             # when use_dualkv, else the original rmpad tensors)
@@ -1472,6 +1522,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # shard boundary rather than the global sequence (issue #6068). This
                 # mirrors what the veomni engine already does for fused kernels.
                 extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+
+        # DualKV: pass the shared prompt-last packed positions to the fused forward so it can
+        # materialize the few shared-logit rows needed for each response's first-token log-prob.
+        if dualkv_shared_positions is not None:
+            extra_args["dualkv_shared_positions"] = dualkv_shared_positions
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
@@ -1593,7 +1648,30 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # the GRPO loss (which masks to response tokens) reads correct values.
                 dualkv_repack_info = output_args.get("dualkv_repack_info", None)
                 if dualkv_repack_info is not None:
-                    log_probs = _dualkv_unpack_logprobs(log_probs, dualkv_repack_info, cu_seqlens)
+                    # log_probs: pass shared_logits so each response's FIRST token is scored by
+                    # ITS OWN first token id (the packed scalar only holds response-0's value).
+                    # Two DualKV log-prob paths produce shared_logits differently:
+                    #   - fused kernels: dense_common projected the shared rows -> output.shared_logits.
+                    #   - eager logits: the FULL packed logits (logits_rmpad) are materialized here, so
+                    #     gather the shared prompt-last rows directly (SP==1 asserted -> no slicing).
+                    dualkv_shared_logits = getattr(output, "shared_logits", None)
+                    if dualkv_shared_logits is None and not use_fused_kernels:
+                        _shared_pos = torch.tensor(
+                            [g["prompt_start"] + g["prompt_len"] - 1
+                             for g in dualkv_repack_info["group_info"]],
+                            device=logits_rmpad.device, dtype=torch.long,
+                        )
+                        dualkv_shared_logits = logits_rmpad.index_select(0, _shared_pos)  # (num_groups, vocab)
+                    assert dualkv_shared_logits is not None, (
+                        "DualKV: could not obtain shared_logits though repack ran. The fused forward "
+                        "(dense_common) must receive dualkv_shared_positions (use_fused_kernels=True), "
+                        "or the eager path must expose logits_rmpad; otherwise first-token log-probs "
+                        "would be silently corrupted."
+                    )
+                    log_probs = _dualkv_unpack_logprobs(
+                        log_probs, dualkv_repack_info, cu_seqlens, shared_logits=dualkv_shared_logits)
+                    # entropy / Σπ² are properties of the shared distribution (label-independent),
+                    # so the scalar copy is correct for them: shared_logits=None keeps that path.
                     if calculate_entropy:
                         entropy_rmpad = _dualkv_unpack_logprobs(entropy_rmpad, dualkv_repack_info, cu_seqlens)
                     if calculate_sum_pi_squared:
