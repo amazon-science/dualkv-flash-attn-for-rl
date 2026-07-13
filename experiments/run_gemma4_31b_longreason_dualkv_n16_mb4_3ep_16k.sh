@@ -2,6 +2,19 @@
 # Gemma4-31B DualKV GRPO on LongReason 16K — single 8xH200, N=16, mb=4, 3 epochs, SP=1.
 # Verified: base val 0.748 -> ~0.80 (peak 0.814); peak mem ~96.8GB; DualKV fwd+bwd active.
 # Set WORKDIR to your gemma4-dev checkout (.venv with flash-attn(DualKV)+verl0.8), DATA_DIR, MODEL_DIR.
+# ============================================================================
+# REPRODUCE (single 8xH200, gemma4-dev):
+#  1. Build env (torch2.11+cu130 / vLLM0.23 / verl0.8 / DualKV flash-attn 2.8.4):
+#       WORKDIR=<root> REPO=<gemma4-dev checkout> VENV=<venv> \
+#         bash experiments/env/build_fa.sh && bash experiments/env/install_verl.sh
+#     (build_fa.sh MUST pip install cu13 nvcc wheels first: nvidia-cuda-nvcc/crt/cccl/nvrtc/nvvm==13.0.x)
+#  2. Data (LongReason 16K split, exact seed/ratio used for the verified run):
+#       python experiments/preprocess_longreason.py --split 16k --train_ratio 0.6 --seed 42 \
+#         --local_save_dir $DATA_DIR   # -> 476 train / 318 test parquet
+#  3. Model: hf download google/gemma-4-31B-it --local-dir $MODEL_DIR
+#  4. Run: WORKDIR=... DATA_DIR=... MODEL_DIR=... bash experiments/run_gemma4_31b_longreason_dualkv_n16_mb4_3ep_16k.sh
+#  Verified result: held-out val 0.748 -> ~0.80 (peak 0.814); peak mem ~96.8GB; ~1220s/step; DualKV fwd+bwd active.
+# ============================================================================
 set -x
 WORKDIR=${WORKDIR:?set to gemma4-dev checkout}
 V=${WORKDIR}/.venv
@@ -73,6 +86,6 @@ $PYTHON -m verl.trainer.main_ppo \
     trainer.total_epochs=3 \
     trainer.total_training_steps=200 \
     trainer.default_local_dir=${CKPT} \
-    trainer.rollout_data_dir=/opt/dlami/nvme/gemma4dev_fresh/rollout_dumps \
+    trainer.rollout_data_dir=${WORKDIR}/rollout_dumps \
     trainer.log_val_generations=20 \
     "$@"
