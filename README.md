@@ -26,7 +26,7 @@ verified at the CUDA-symbol level (eBPF uprobe on `mha_dualkv_varlen_fwd/bwd`), 
 | Task / context | LongReason, 16384 prompt / 2048 response, thinking ON |
 | Rollouts / micro-batch | `N=16` / `mb=4` |
 | Parallelism | rollout TP=4, **SP=1**, no param/optimizer offload |
-| Duration | 3 epochs (21 steps), ~23 min/step |
+| Duration | 3 epochs (21 steps), ~1220 s (~20 min) per step |
 | Peak GPU mem (policy-update) | **~96.8 GB / 140 GB** (H200), flat across all steps |
 | DualKV kernel | fwd + bwd verified active (eBPF, ~3M kernel calls) |
 | **Held-out val accuracy** | **0.748 (base) → ~0.80 (peak 0.814 @ step 18)** |
@@ -35,6 +35,23 @@ Reward is a strict verifiable check: `1.0` iff the response follows the instruct
 (`"The answer is X"`, X∈A–E) **and** matches ground truth — so the policy is rewarded for
 instruction-following, not just the right letter buried in prose. Extractor verified bug-free over 794
 LongReason tasks (`experiments/reward_longreason.py`).
+
+**Per-step wall-clock breakdown** (representative mid-run step; stable ±5% across steps):
+
+| Phase | Time | Share |
+|-------|------|-------|
+| Total step | 1220.6 s (~20 min) | 100% |
+| gen (vLLM rollout, N=16) | 301.3 s | 25% |
+| **update_actor (policy update)** | **563.9 s (~9.4 min)** | **46%** |
+| old_log_prob | 142.6 s | 12% |
+| ref_log_prob | 143.3 s | 12% |
+| testing (per-step validation) | 190.0 s | 16% |
+| adv + reward | ~4 s | <1% |
+
+DualKV accelerates the compute-bound forward/backward phases (`update_actor` + the two log-prob passes ≈
+850 s); rollout `gen` is plain vLLM and unaffected. The 190 s of `testing` reflects `test_freq=1`
+(validation every step, used here to plot the accuracy curve) — a normal run (`test_freq=10`) drops it,
+cutting the step to ~17 min.
 
 > **Larger batches:** `N=32`/`mb=8` also runs (policy-update peak ~90.8 GB) but needs
 > `gpu_memory_utilization=0.3` (not 0.4) to leave headroom for vLLM's KV re-acquire on wake; at 0.4 it
