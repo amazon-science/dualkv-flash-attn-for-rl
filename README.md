@@ -10,35 +10,77 @@ DualKV deduplicates shared prompts in GRPO/DAPO training — instead of computin
 
 Gemma 4 adds: a **head-dim 512** DualKV kernel (global attention layers) and **kernel-native causal sliding-window attention** (sliding layers, `W=1024`), plus the veRL integration for the hybrid `Gemma4ForCausalLM` decoder (60 layers: 50 sliding hd256 / 10 global hd512, GQA, `attention_k_eq_v`).
 
-**Required environment** (do not substitute versions — these are co-pinned; in particular vLLM **0.19.1**, not a newer release):
+### ✨ Highlight: DualKV runs Gemma-4-31B GRPO end-to-end (and the model improves)
+
+DualKV runs a full **Gemma-4-31B GRPO training run on a single 8×H200 node** — the hd512 global layers
+route through the DualKV kernel (which FA2's fused path cannot serve at hd>256), with 16K-token shared
+prompts and `N=16` rollouts, **SP=1, no parameter/optimizer offload**. DualKV kernel activity is
+verified at the CUDA-symbol level (eBPF uprobe on `mha_dualkv_varlen_fwd/bwd`), and held-out accuracy
+**improves under GRPO** — confirming the pipeline is not just running but training.
+
+<a name="verified-run"></a>**Verified run (single 8×H200, from-scratch pip venv, `gemma4-dev`):**
+
+| Setting | Value |
+|---------|-------|
+| Model | Gemma-4-31B-it (31.27B, hd512 global + hd256 sliding) |
+| Task / context | LongReason, 16384 prompt / 2048 response, thinking ON |
+| Rollouts / micro-batch | `N=16` / `mb=4` |
+| Parallelism | rollout TP=4, **SP=1**, no param/optimizer offload |
+| Duration | 3 epochs (21 steps), ~23 min/step |
+| Peak GPU mem (policy-update) | **~96.8 GB / 140 GB** (H200), flat across all steps |
+| DualKV kernel | fwd + bwd verified active (eBPF, ~3M kernel calls) |
+| **Held-out val accuracy** | **0.748 (base) → ~0.80 (peak 0.814 @ step 18)** |
+
+Reward is a strict verifiable check: `1.0` iff the response follows the instructed format
+(`"The answer is X"`, X∈A–E) **and** matches ground truth — so the policy is rewarded for
+instruction-following, not just the right letter buried in prose. Extractor verified bug-free over 794
+LongReason tasks (`experiments/reward_longreason.py`).
+
+> **Larger batches:** `N=32`/`mb=8` also runs (policy-update peak ~90.8 GB) but needs
+> `gpu_memory_utilization=0.3` (not 0.4) to leave headroom for vLLM's KV re-acquire on wake; at 0.4 it
+> hits a vLLM cumem OOM at the second step's rollout. `N=16`/`mb=4` at 0.4 is the stable default above.
+
+**Required environment** (verified end-to-end on 8×H200; these versions are co-pinned and known-good):
 
 | Package | Version | Notes |
 |---------|---------|-------|
 | Python | 3.12 | |
-| PyTorch | 2.10.0+cu128 | torchvision 0.25.0, torchaudio 2.10.0 (hard-pinned by vLLM 0.19.1) |
-| CUDA | 12.8 | toolkit required to build the kernel; arch `90` (H100) |
-| flash-attn | included (with DualKV + hd512 + SWA) | rebuild against torch 2.10 |
-| veRL | 0.7.0 (included, with DualKV + Gemma4 integration) | |
-| vLLM | **0.19.1** | the Gemma4 [recipe](https://recipes.vllm.ai/Google/gemma-4-31B-it)-pinned version; newer (0.22) respawn-loops verl 0.7.0's rollout |
-| Transformers | 5.9.0 | Gemma 4 needs ≥5.6 |
-| Ray | 2.55.1 | |
+| PyTorch | 2.11.0+cu130 | torchvision 0.26.0, torchaudio 2.11.0 |
+| CUDA | 13.0 (from pip wheels) | arch `90` (H100/H200); see nvcc note below |
+| flash-attn | 2.8.4 (included, with DualKV + hd512 + SWA) | built against torch 2.11 |
+| veRL | 0.8.0.dev (included, with DualKV + Gemma4 integration) | |
+| vLLM | 0.23.0 | loads `Gemma4ForConditionalGeneration` (needs torchvision) |
+| Transformers | 5.12.1 | Gemma 4 needs ≥5.6 |
+| Ray | 2.49.0 | |
+
+> **Verified 2026-07:** Gemma4-31B DualKV GRPO runs end-to-end on a single 8×H200 node with this stack
+> (TP=4 rollout, SP=1, no offload, `gpu_memory_utilization=0.4`). See [Verified run](#verified-run) below.
 
 ```bash
 git checkout gemma4-dev
 python3 -m venv .venv && source .venv/bin/activate
-pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 
-# flash-attention (with DualKV hd512 + SWA kernels), built against torch 2.10
+# IMPORTANT: `pip install torch` pulls the cu13 RUNTIME but NOT the nvcc toolchain needed to build the
+# kernel. Install the cu13 compiler wheels explicitly, or the flash-attn build fails with
+# "No such file or directory: .../nvidia/cu13/bin/nvcc".
+pip install nvidia-cuda-nvcc==13.0.88 nvidia-cuda-crt==13.0.88 nvidia-cuda-cccl==13.0.85 \
+            nvidia-cuda-nvrtc==13.0.88 nvidia-nvvm==13.0.88
+
+# flash-attention (with DualKV hd512 + SWA kernels), built against torch 2.11 / cu13
 cd flash-attention
 pip install ninja numpy packaging
-git clone --depth 1 https://github.com/NVIDIA/cutlass.git csrc/cutlass
-FLASH_ATTN_CUDA_ARCHS=90 pip install -e . --no-build-isolation
+git clone https://github.com/NVIDIA/cutlass.git csrc/cutlass
+git -C csrc/cutlass checkout 7127592069c2fe01b041e174ba4345ef9b279671   # pinned
+# point the build at the pip cu13 toolkit (NV=.../site-packages/nvidia):
+export CUDA_HOME=$NV/cu13 LIBRARY_PATH=$NV/cu13/lib TORCH_CUDA_ARCH_LIST=9.0a
+pip install -e . --no-build-isolation   # ~8 min compile
 cd ..
 
 # veRL with DualKV + Gemma4 integration
 cd verl && pip install -e . && cd ..
 
-pip install vllm==0.19.1 transformers==5.9.0 ray==2.55.1 wandb pandas pyarrow
+pip install vllm==0.23.0 transformers==5.12.1 ray==2.49.0 wandb pandas pyarrow
 ```
 
 Verify the Gemma 4 kernels:
