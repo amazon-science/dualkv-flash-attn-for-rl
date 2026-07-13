@@ -1,25 +1,40 @@
 """
 LongReason binary reward function for veRL GRPO training.
 
-Extracts the answer letter (A-E) from the response text after </think>,
-compares against the ground truth. Returns 1.0 for exact match, 0.0 otherwise.
+The prompt instructs the model to end with the EXACT format:
+    "Provide the final answer on the last line using 'The answer is' + option (A, B, C, D, E)."
+
+STRICT extraction (no fallbacks): we only accept the answer when it is emitted in
+that specified format ("The answer is X"). If the response does not follow the
+instruction, the model is not doing what it was told, so it gets reward 0 — we do
+NOT reward correct-but-unformatted answers (that would train the policy to ignore
+the output-format instruction).
+
+Note on Gemma4 reasoning mode: the model emits reasoning wrapped in
+`<|channel>thought ... <channel|>` then the final answer. verl decodes the reward
+response with skip_special_tokens=True (verl/workers/reward_manager/naive.py), so
+those channel tokens are stripped before this function sees `solution_str`. The
+"The answer is X" line survives stripping and is what we key on.
 
 Config:
     reward.custom_reward_function.path=<path>/reward_longreason.py
     reward.custom_reward_function.name=compute_score
 """
 
+import re
+
+# The ONE accepted format, matching the prompt's instruction exactly:
+# "The answer is X" (case-insensitive on the phrase, optional trailing punctuation).
+# X must be a standalone A-E letter. Take the LAST such match (the model may restate;
+# the final "The answer is X" is the committed answer).
+_ANSWER_RE = re.compile(r"the\s+answer\s+is\s+([A-Ea-e])\b", re.IGNORECASE)
+
 
 def _extract_answer(text):
-    think_end = text.find("</think>")
-    if think_end != -1:
-        answer_part = text[think_end + 8:]
-    else:
-        answer_part = text
-    for ch in answer_part:
-        if ch in "ABCDE":
-            return ch
-    return ""
+    if not isinstance(text, str):
+        return ""
+    matches = _ANSWER_RE.findall(text)
+    return matches[-1].upper() if matches else ""
 
 
 def compute_score(
