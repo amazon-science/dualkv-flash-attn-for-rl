@@ -1424,7 +1424,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
             # when use_dualkv, else the original rmpad tensors)
             if self.use_ulysses_sp:
                 is_vlm_model = hasattr(getattr(self.module, "module", self.module).config, "vision_config")
-                if is_vlm_model:
+                # DualKV exception: on the DualKV path `input_ids_rmpad` is the repacked,
+                # text-only packed stream and we pass `input_ids` (not `inputs_embeds`) to the
+                # model. The VLM "slice-after-embedding" hook (patch_vlm_for_ulysses_input_slicing)
+                # keys on `inputs_embeds is not None`, so it would NEVER fire here and the sequence
+                # would reach the attention module UNSLICED (T_full). The DualKV attention wrapper
+                # then all-to-alls as if the seq were sharded, so its output seq disagrees with HF's
+                # `input_shape` (=T_full) by a factor of SP -> reshape mis-splits -> o_proj sees
+                # hidden/SP. Multimodal Gemma4 (Gemma4ForConditionalGeneration) reports
+                # is_vlm_model=True even for text-only RL, so force the slice branch under DualKV.
+                if is_vlm_model and dualkv_ctx is None:
                     # vlm model's inputs will be sliced after embedding
                     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
                         input_ids_rmpad,
