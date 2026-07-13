@@ -1304,20 +1304,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
             dualkv_shared_positions = None
             use_dualkv = getattr(self.model_config, "use_dualkv", False)
             if use_dualkv:
-                # SP=1 ONLY. The fused DualKV log-prob path recomputes each response's first
-                # token from `shared_logits`, which is projected from the FULL, un-sliced
-                # packed hidden_states at the packed index prompt_start+P-1 (see
-                # dense_common._dualkv_shared_logits). Under Ulysses SP>1 the packed stream is
-                # sequence-sliced across ranks, so that global index would land on the wrong
-                # rank/token and silently corrupt the first-token log-prob. Fail loudly here
-                # rather than train on corrupted log-probs. (SP>1 support needs the shared
-                # position mapped into local shard coordinates + an all-gather; not done yet.)
-                assert self.ulysses_sequence_parallel_size == 1, (
-                    "DualKV (use_dualkv=True) currently requires ulysses_sequence_parallel_size==1. "
-                    f"Got sp={self.ulysses_sequence_parallel_size}. The fused first-token log-prob "
-                    "recompute indexes the full packed sequence, which SP>1 slices across ranks. "
-                    "Set ulysses_sequence_parallel_size=1 or disable use_dualkv."
-                )
+                # SP>1 supported. The fused DualKV log-prob path recomputes each response's
+                # first token from `shared_logits`, projected from the shared prompt-last
+                # (P-1) hidden state. `dualkv_shared_positions` are GLOBAL packed indices built
+                # below BEFORE the Ulysses SP slice; under SP>1 the packed stream is sliced
+                # contiguously across ranks, and dense_common._dualkv_shared_logits maps each
+                # global position to its owner rank + local index and all-reduces the shared
+                # hidden vectors across the SP group so every rank holds the full set. (The
+                # attention layer's SP all-to-all is handled separately in monkey_patch.)
                 # Gemma4-only guard: HF Gemma4ForCausalLM.forward does NOT pass arbitrary
                 # kwargs into self.model (unlike Qwen3, which threads **kwargs end-to-end),
                 # so dualkv_context only reaches attention via verl's replacement forward in
@@ -1415,11 +1409,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     temperature_rmpad = torch.cat(_t_parts).unsqueeze(0)  # (1, total_packed)
                     output_args["dualkv_repack_info"] = dualkv_repack_info
                     output_args["dualkv_orig_cu_seqlens"] = cu_seqlens
-                    # Packed index of each group's shared prompt-last token (predicts the
-                    # first response token for every response in the group). Threaded to the
-                    # fused forward so it can project just these rows through the LM head
-                    # (dense_common._dualkv_shared_logits). SP==1 asserted above, so these
-                    # indices address the full un-sliced packed stream directly.
+                    # GLOBAL packed index of each group's shared prompt-last token (predicts
+                    # the first response token for every response in the group), computed BEFORE
+                    # the SP slice below. Threaded to the fused forward, which projects these
+                    # rows through the LM head (dense_common._dualkv_shared_logits) — under SP>1
+                    # that fn maps each global index to its owner rank + local shard offset and
+                    # all-reduces the shared hidden vectors across the SP group.
                     dualkv_shared_positions = [
                         g["prompt_start"] + g["prompt_len"] - 1
                         for g in dualkv_repack_info["group_info"]
@@ -1653,9 +1648,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # Two DualKV log-prob paths produce shared_logits differently:
                     #   - fused kernels: dense_common projected the shared rows -> output.shared_logits.
                     #   - eager logits: the FULL packed logits (logits_rmpad) are materialized here, so
-                    #     gather the shared prompt-last rows directly (SP==1 asserted -> no slicing).
+                    #     gather the shared prompt-last rows directly. logits_rmpad is the LOCAL SP
+                    #     shard (never SP-gathered), so global-index select is only valid at SP==1;
+                    #     SP>1 must use the fused path (output.shared_logits handles the cross-rank
+                    #     gather in dense_common). Gemma4 requires fused kernels, so this is not hit
+                    #     for it; guard for the Qwen eager path.
                     dualkv_shared_logits = getattr(output, "shared_logits", None)
                     if dualkv_shared_logits is None and not use_fused_kernels:
+                        assert self.ulysses_sequence_parallel_size == 1, (
+                            "DualKV eager (non-fused) log-prob path requires SP==1: logits_rmpad is the "
+                            "local SP shard, so global shared-position indexing is invalid under SP>1. "
+                            "Use use_fused_kernels=True for DualKV + SP>1 (its shared_logits gather is "
+                            "SP-correct)."
+                        )
                         _shared_pos = torch.tensor(
                             [g["prompt_start"] + g["prompt_len"] - 1
                              for g in dualkv_repack_info["group_info"]],

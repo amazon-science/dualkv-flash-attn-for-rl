@@ -43,14 +43,24 @@ def _dualkv_shared_logits(hidden_states, lm_head_weight, dualkv_shared_positions
     (handled downstream in `_dualkv_extract_logprobs_fused`). We therefore project just
     those few rows (one per group) through the LM head here.
 
-    Assumes SP=1: `hidden_states` is the full, un-sliced packed stream so the packed
-    `dualkv_shared_positions` index it directly. The producer asserts SP==1 before this
-    runs. Returns None when DualKV is not active (positions not passed).
+    `dualkv_shared_positions` are GLOBAL packed indices into the un-sliced stream.
+
+    SP=1: `hidden_states` is the full packed stream, so the positions index it directly.
+
+    SP>1 (Ulysses): the packed stream is sliced CONTIGUOUSLY across ranks
+    (`slice_input_tensor`: rank r owns `[r*parts : (r+1)*parts]`, `parts = padded_len/SP`).
+    A group's shared position P-1 lands on exactly ONE rank, but that group's responses may
+    be spread across several ranks — so every rank needs every group's shared hidden state.
+    We map each global position -> (owner_rank, local_index), have each rank project only the
+    shared positions it locally owns, then ALL-GATHER the `num_groups` shared hidden vectors
+    across the SP group so all ranks hold the full set before the LM-head projection. Payload
+    is `num_groups * hidden` (tiny, context-length-independent). Gather hidden (pre-projection,
+    dim=hidden) not logits (dim=vocab) to minimise traffic.
 
     Args:
-        hidden_states: (1, total_packed, hidden) or (total_packed, hidden)
+        hidden_states: (1, local_len, hidden) or (local_len, hidden) — the rank's LOCAL shard
         lm_head_weight: (vocab, hidden)
-        dualkv_shared_positions: list[int] packed indices of shared prompt-last tokens
+        dualkv_shared_positions: list[int] GLOBAL packed indices of shared prompt-last tokens
         temperature: float, applied to match the fused kernels' logit scaling
 
     Returns:
@@ -58,9 +68,41 @@ def _dualkv_shared_logits(hidden_states, lm_head_weight, dualkv_shared_positions
     """
     if dualkv_shared_positions is None:
         return None
-    hs = hidden_states.squeeze(0) if hidden_states.dim() == 3 else hidden_states  # (total_packed, hidden)
-    pos = torch.as_tensor(dualkv_shared_positions, device=hs.device, dtype=torch.long)
-    shared_hs = hs.index_select(0, pos)  # (num_groups, hidden)
+    from verl.utils.ulysses import (
+        get_ulysses_sequence_parallel_group,
+        get_ulysses_sequence_parallel_world_size,
+    )
+
+    hs = hidden_states.squeeze(0) if hidden_states.dim() == 3 else hidden_states  # (local_len, hidden)
+    device = hs.device
+    pos = torch.as_tensor(dualkv_shared_positions, device=device, dtype=torch.long)  # global, (num_groups,)
+    num_groups = pos.numel()
+    hidden = hs.size(-1)
+
+    sp_size = get_ulysses_sequence_parallel_world_size()
+    if sp_size <= 1:
+        # SP=1: hidden_states is the full stream; global positions index it directly.
+        shared_hs = hs.index_select(0, pos)  # (num_groups, hidden)
+        shared_logits = shared_hs.to(lm_head_weight.dtype) @ lm_head_weight.t()
+        return (shared_logits / temperature).float()
+
+    # SP>1: hs is this rank's contiguous slice of length `parts` (== hs.size(0), all shards equal
+    # after padding). Map each global position to its owner rank + local index.
+    import torch.distributed as dist
+    group = get_ulysses_sequence_parallel_group()
+    parts = hs.size(0)
+    owner = pos // parts                 # (num_groups,) which rank holds each shared position
+    local_idx = pos % parts
+    rank = dist.get_rank(group)
+
+    # This rank projects ONLY the shared positions it owns; others left as zeros. Since each
+    # position has exactly one owner, summing across ranks (all_reduce) reconstructs the full set.
+    mine = (owner == rank)
+    shared_hs = hs.new_zeros(num_groups, hidden)
+    if mine.any():
+        shared_hs[mine] = hs.index_select(0, local_idx[mine]).to(shared_hs.dtype)
+    dist.all_reduce(shared_hs, op=dist.ReduceOp.SUM, group=group)  # (num_groups, hidden) on every rank
+
     shared_logits = shared_hs.to(lm_head_weight.dtype) @ lm_head_weight.t()  # (num_groups, vocab)
     return (shared_logits / temperature).float()
 
